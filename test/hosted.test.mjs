@@ -1,0 +1,258 @@
+/**
+ * Hosted mode end to end: the real server (`--http`) against a fake Hetzner API.
+ * Flow: MCP client OAuth with this server -> connect page -> store a token per
+ * project / a Robot webservice user -> tools routed by `project`.
+ */
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import http from 'node:http';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { after, before, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+const ENTRY = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+const TENANTS = [
+  { id: 'prod', name: 'Production', type: 'cloud', writes: false },
+  { id: 'Stage', name: 'Staging', type: 'cloud', writes: true },
+  { id: 'metal', name: 'Dedicated servers', type: 'robot', writes: true },
+];
+const ROBOT_AUTH = 'Basic ' + Buffer.from('#ws+abc:robot-secret').toString('base64');
+
+const freePort = () =>
+  new Promise((resolve) => {
+    const s = http.createServer();
+    s.listen(0, '127.0.0.1', () => {
+      const { port } = s.address();
+      s.close(() => resolve(port));
+    });
+  });
+
+const fake = { tokens: new Set(['token-prod-1111', 'token-stage-2222']), calls: [] };
+let fakeServer, server, base, dir, serverLog = '';
+
+before(async () => {
+  const fakePort = await freePort();
+  fakeServer = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const url = new URL(req.url, 'http://x');
+      const auth = req.headers.authorization ?? '';
+      const json = (status, data) => {
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(data));
+      };
+      fake.calls.push({ method: req.method, path: url.pathname, auth });
+      if (url.pathname.startsWith('/robot/')) {
+        if (auth !== ROBOT_AUTH) return json(401, { error: { status: 401, code: 'UNAUTHORIZED', message: 'Unauthorized' } });
+        if (url.pathname === '/robot/server') return json(200, [{ server: { server_number: 7, server_name: 'box' } }]);
+        return json(404, { error: { status: 404, code: 'NOT_FOUND', message: 'not found' } });
+      }
+      const token = auth.replace(/^Bearer /, '');
+      if (!fake.tokens.has(token)) return json(401, { error: { code: 'unauthorized', message: 'unable to authenticate' } });
+      if (url.pathname === '/v1/locations') return json(200, { locations: [] });
+      if (url.pathname === '/v1/servers' && req.method === 'GET') return json(200, { servers: [{ id: 1, name: `server-of-${token}` }], meta: { pagination: { next_page: null } } });
+      if (url.pathname === '/v1/servers/1' && req.method === 'DELETE') return json(200, { action: { id: 1, status: 'success' } });
+      json(404, { error: { code: 'not_found', message: 'unknown route' } });
+    });
+  });
+  await new Promise((r) => fakeServer.listen(fakePort, '127.0.0.1', r));
+
+  const port = await freePort();
+  base = `http://localhost:${port}`;
+  dir = mkdtempSync(path.join(tmpdir(), 'hetzner-mcp-test-'));
+  server = spawn(process.execPath, [ENTRY, '--http'], {
+    env: {
+      PATH: process.env.PATH,
+      PORT: String(port),
+      HOST: '127.0.0.1',
+      HETZNER_MCP_PUBLIC_URL: base,
+      HETZNER_MCP_SECRET: 'test-secret-test-secret-test-secret-1234',
+      HETZNER_MCP_TENANTS: JSON.stringify({ tenants: TENANTS }),
+      HETZNER_MCP_DB_PATH: path.join(dir, 'db.sqlite'),
+      HETZNER_CLOUD_API_URL: `http://127.0.0.1:${fakePort}/v1`,
+      HETZNER_API_URL: `http://127.0.0.1:${fakePort}/v1`,
+      HETZNER_ROBOT_API_URL: `http://127.0.0.1:${fakePort}/robot`,
+    },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  server.stderr.on('data', (c) => (serverLog += c));
+  for (let i = 0; i < 100; i++) {
+    try {
+      if ((await fetch(`${base}/healthz`)).ok) return;
+    } catch {
+      /* not up yet */
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error(`server did not start: ${serverLog}`);
+});
+
+after(() => {
+  server?.kill();
+  fakeServer?.close();
+  if (dir) rmSync(dir, { recursive: true, force: true });
+});
+
+const form = (data) => ({ method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(data) });
+
+/** Runs the MCP client's OAuth flow up to the connect page. */
+async function startAuthorization() {
+  const redirectUri = 'http://localhost:9/callback';
+  const reg = await fetch(`${base}/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: [redirectUri], client_name: 'test client', token_endpoint_auth_method: 'none' }),
+  });
+  assert.equal(reg.status, 201, await reg.clone().text());
+  const client = await reg.json();
+  const verifier = randomBytes(32).toString('base64url');
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
+  const authorize = await fetch(
+    `${base}/authorize?${new URLSearchParams({ response_type: 'code', client_id: client.client_id, redirect_uri: redirectUri, code_challenge: challenge, code_challenge_method: 'S256', state: 'xyz', resource: `${base}/mcp` })}`,
+    { redirect: 'manual' },
+  );
+  assert.equal(authorize.status, 302, await authorize.clone().text());
+  const page = authorize.headers.get('location');
+  assert.match(page, /^\/connect\/[\w-]+$/);
+  return { client, verifier, redirectUri, page: `${base}${page}` };
+}
+
+async function finishAuthorization({ client, verifier, redirectUri, page }) {
+  const finish = await fetch(`${page}/finish`, form({}));
+  assert.equal(finish.status, 303);
+  const target = new URL(finish.headers.get('location'));
+  assert.equal(target.origin + target.pathname, redirectUri);
+  assert.equal(target.searchParams.get('state'), 'xyz');
+  const token = await fetch(`${base}/token`, form({ grant_type: 'authorization_code', code: target.searchParams.get('code'), code_verifier: verifier, client_id: client.client_id, redirect_uri: redirectUri }));
+  assert.equal(token.status, 200, await token.clone().text());
+  return token.json();
+}
+
+let rpcId = 0;
+async function rpc(accessToken, method, params) {
+  const res = await fetch(`${base}/mcp`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}) },
+    body: JSON.stringify({ jsonrpc: '2.0', id: ++rpcId, method, ...(params ? { params } : {}) }),
+  });
+  return { status: res.status, body: res.status === 200 ? await res.json() : await res.text() };
+}
+const call = async (accessToken, name, args) => {
+  const { body } = await rpc(accessToken, 'tools/call', { name, arguments: args });
+  return { text: body.result.content[0].text, isError: body.result.isError === true, structured: body.result.structuredContent };
+};
+
+let tokens;
+
+test('OAuth metadata is served and /mcp requires a token', async () => {
+  const meta = await (await fetch(`${base}/.well-known/oauth-authorization-server`)).json();
+  assert.equal(meta.token_endpoint, `${base}/token`);
+  const unauth = await rpc(undefined, 'tools/list');
+  assert.equal(unauth.status, 401);
+});
+
+test('connect page: rejects bad credentials, stores good ones, then issues tokens', async () => {
+  const flow = await startAuthorization();
+  const html = await (await fetch(flow.page)).text();
+  for (const t of TENANTS) assert.ok(html.includes(t.name), t.name);
+  assert.match(html, /Nur lesen/);
+
+  const early = await fetch(`${flow.page}/finish`, form({}));
+  assert.match(early.headers.get('location'), /e=none_connected/);
+
+  const bad = await fetch(`${flow.page}/tenants/prod/key`, form({ api_token: 'wrong-token' }));
+  assert.equal(bad.status, 400);
+  assert.match(await bad.text(), /nicht akzeptiert/);
+
+  const good = await fetch(`${flow.page}/tenants/prod/key`, form({ api_token: 'token-prod-1111' }));
+  assert.equal(good.status, 303);
+  assert.match(good.headers.get('location'), /n=connected&t=prod/);
+  assert.equal((await fetch(`${flow.page}/tenants/stage/key`, form({ api_token: 'token-stage-2222' }))).status, 303);
+
+  const badRobot = await fetch(`${flow.page}/tenants/metal/key`, form({ robot_user: '#ws+abc', robot_password: 'nope' }));
+  assert.equal(badRobot.status, 400);
+  assert.equal((await fetch(`${flow.page}/tenants/metal/key`, form({ robot_user: '#ws+abc', robot_password: 'robot-secret' }))).status, 303);
+
+  const after = await (await fetch(flow.page)).text();
+  assert.match(after, /Token …1111/);
+  assert.doesNotMatch(after, /token-prod-1111|robot-secret/);
+
+  tokens = await finishAuthorization(flow);
+  assert.ok(tokens.access_token && tokens.refresh_token);
+  assert.equal((await fetch(flow.page)).status, 400, 'session is single use');
+
+  const db = readFileSync(path.join(dir, 'db.sqlite'), 'latin1');
+  for (const secret of ['token-prod-1111', 'token-stage-2222', 'robot-secret', tokens.access_token]) assert.ok(!db.includes(secret), `${secret} stored in plain text`);
+});
+
+test('tools are routed by project and respect read-only tenants', async () => {
+  const list = await rpc(tokens.access_token, 'tools/list');
+  assert.deepEqual(list.body.result.tools.map((t) => t.name).sort(), ['hetzner_execute', 'hetzner_list_accounts', 'hetzner_query', 'hetzner_search']);
+
+  const ambiguous = await call(tokens.access_token, 'hetzner_query', { code: "async () => hetzner.get('/servers')" });
+  assert.equal(ambiguous.isError, true);
+  assert.match(ambiguous.text, /prod, stage/);
+
+  const prod = await call(tokens.access_token, 'hetzner_query', { code: "async () => (await hetzner.get('/servers')).servers[0].name", project: 'prod' });
+  assert.equal(JSON.parse(prod.text), 'server-of-token-prod-1111');
+  const stage = await call(tokens.access_token, 'hetzner_query', { code: "async () => (await hetzner.get('/servers')).servers[0].name", project: 'STAGE' });
+  assert.equal(JSON.parse(stage.text), 'server-of-token-stage-2222');
+
+  fake.calls.length = 0;
+  const blocked = await call(tokens.access_token, 'hetzner_execute', { code: "async () => hetzner.delete('/servers/1')", project: 'prod' });
+  assert.equal(blocked.isError, true);
+  assert.match(blocked.text, /read-only/);
+  assert.equal(fake.calls.length, 0);
+  const allowed = await call(tokens.access_token, 'hetzner_execute', { code: "async () => (await hetzner.delete('/servers/1')).action.status", project: 'stage' });
+  assert.equal(JSON.parse(allowed.text), 'success');
+
+  const robot = await call(tokens.access_token, 'hetzner_query', { code: "async () => (await robot.get('/server'))[0].server.server_name" });
+  assert.equal(JSON.parse(robot.text), 'box');
+  assert.equal(fake.calls.at(-1).auth, ROBOT_AUTH);
+});
+
+test('rejected credentials are marked and the model gets a link to replace them', async () => {
+  fake.tokens.delete('token-stage-2222');
+  const failed = await call(tokens.access_token, 'hetzner_query', { code: "async () => hetzner.get('/servers')", project: 'stage' });
+  assert.equal(failed.isError, true);
+  assert.match(failed.text, /HTTP 401/);
+
+  const accounts = await call(tokens.access_token, 'hetzner_list_accounts', {});
+  const byId = Object.fromEntries(accounts.structured.accounts.map((a) => [a.id, a]));
+  assert.equal(byId.stage.status, 'rejected');
+  assert.equal(byId.prod.status, 'connected');
+  assert.equal(byId.metal.argument, 'robot_account');
+  assert.doesNotMatch(accounts.text, /token-prod-1111|robot-secret/);
+
+  const gone = await call(tokens.access_token, 'hetzner_query', { code: "async () => hetzner.get('/servers')", project: 'stage' });
+  assert.match(gone.text, /Unknown project "stage"/);
+
+  // The manage link opens the connect page for the same person; a new token repairs the connection.
+  const link = accounts.structured.connect_url;
+  assert.match(await (await fetch(link)).text(), /abgelehnt/);
+  fake.tokens.add('token-stage-3333');
+  assert.equal((await fetch(`${link}/tenants/stage/key`, form({ api_token: 'token-stage-3333' }))).status, 303);
+  const repaired = await call(tokens.access_token, 'hetzner_query', { code: "async () => (await hetzner.get('/servers')).servers[0].name", project: 'stage' });
+  assert.equal(JSON.parse(repaired.text), 'server-of-token-stage-3333');
+});
+
+test('refresh tokens rotate and a second person sees only their own connections', async () => {
+  const flow = await startAuthorization();
+  assert.doesNotMatch(await (await fetch(flow.page)).text(), /Token …1111/);
+  assert.equal((await fetch(`${flow.page}/tenants/prod/key`, form({ api_token: 'token-prod-1111' }))).status, 303);
+  const other = await finishAuthorization(flow);
+  const robot = await call(other.access_token, 'hetzner_query', { code: "async () => robot.get('/server')" });
+  assert.equal(robot.isError, true);
+  assert.match(robot.text, /No Hetzner Robot account is connected/);
+  const one = await call(other.access_token, 'hetzner_query', { code: "async () => (await hetzner.get('/servers')).servers.length" });
+  assert.equal(one.text, '1');
+
+  const refreshed = await fetch(`${base}/token`, form({ grant_type: 'refresh_token', refresh_token: other.refresh_token, client_id: flow.client.client_id }));
+  assert.equal(refreshed.status, 200);
+  const reuse = await fetch(`${base}/token`, form({ grant_type: 'refresh_token', refresh_token: other.refresh_token, client_id: flow.client.client_id }));
+  assert.equal(reuse.status, 400);
+});
