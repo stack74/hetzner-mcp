@@ -1,7 +1,7 @@
 {
   "tenants": [
     { "id": "prod", "name": "Production", "type": "cloud", "writes": false },
-    { "id": "staging", "name": "Staging", "type": "cloud", "writes": true },
+    { "id": "staging", "name": "Staging", "type": "cloud", "writes": true, "billed": true },
     { "id": "dedicated", "name": "Dedicated servers", "type": "robot", "writes": false }
   ]
 }

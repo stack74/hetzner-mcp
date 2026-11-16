@@ -207,8 +207,12 @@ test('tools are routed by project and respect read-only tenants', async () => {
   assert.equal(blocked.isError, true);
   assert.match(blocked.text, /read-only/);
   assert.equal(fake.calls.length, 0);
-  const allowed = await call(tokens.access_token, 'hetzner_execute', { code: "async () => (await hetzner.delete('/servers/1')).action.status", project: 'stage' });
+  const unconfirmed = await call(tokens.access_token, 'hetzner_execute', { code: "async () => hetzner.delete('/servers/1')", project: 'stage' });
+  assert.match(unconfirmed.text, /was NOT sent, it needs the user's approval first/);
+  const allowed = await call(tokens.access_token, 'hetzner_execute', { code: "async () => (await hetzner.delete('/servers/1')).action.status", project: 'stage', confirmed: true });
   assert.equal(JSON.parse(allowed.text), 'success');
+  const billed = await call(tokens.access_token, 'hetzner_execute', { code: "async () => hetzner.post('/servers', { name: 'a', server_type: 'cx23', image: 'x' })", project: 'stage', confirmed: true });
+  assert.match(billed.text, /billed requests are switched off for this project.*"billed": true in the tenant configuration/s);
 
   const robot = await call(tokens.access_token, 'hetzner_query', { code: "async () => (await robot.get('/server'))[0].server.server_name" });
   assert.equal(JSON.parse(robot.text), 'box');

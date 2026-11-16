@@ -26,6 +26,8 @@ Environment (at least one credential):
 
 Optional:
   HETZNER_READ_ONLY=1             Remove hetzner_execute; only GET requests are possible.
+  HETZNER_ALLOW_BILLED=1          Allow requests that cost money (new servers, volumes, IPs, ...). Default: refused.
+  HETZNER_SKIP_CONFIRMATION=1     Send billed and destructive requests without asking for approval first.
   HETZNER_EXECUTE_TIMEOUT_SECONDS Maximum runtime of one code run (default 120).
   HETZNER_REQUEST_TIMEOUT_SECONDS Timeout of a single API call (default 30).
   HETZNER_MAX_REQUESTS_PER_RUN    API calls allowed per code run (default 200).

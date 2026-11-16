@@ -10,6 +10,8 @@ export interface CloudProject {
   token: string;
   /** false: only GET requests reach this project, also through hetzner_execute. */
   writes: boolean;
+  /** true: requests that create billable resources or raise a price are allowed. */
+  billed: boolean;
   /** Human-readable name, shown to the model. */
   label?: string;
 }
@@ -19,6 +21,7 @@ export interface RobotAccount {
   user: string;
   password: string;
   writes: boolean;
+  billed: boolean;
   label?: string;
 }
 
@@ -27,6 +30,8 @@ export interface Limits {
   requestTimeoutMs: number;
   maxOutputChars: number;
   maxRequestsPerRun: number;
+  /** false: billed and destructive requests are sent without asking for approval. */
+  confirm: boolean;
   baseUrls: Record<ApiName, string>;
 }
 
@@ -52,6 +57,7 @@ export function loadLimits(env: NodeJS.ProcessEnv = process.env): Limits {
     requestTimeoutMs: intEnv(env, 'HETZNER_REQUEST_TIMEOUT_SECONDS', 30) * 1000,
     maxOutputChars: intEnv(env, 'HETZNER_MAX_OUTPUT_CHARS', 40_000),
     maxRequestsPerRun: intEnv(env, 'HETZNER_MAX_REQUESTS_PER_RUN', 200),
+    confirm: !/^(1|true|yes)$/i.test(env.HETZNER_SKIP_CONFIRMATION ?? ''),
     baseUrls: {
       cloud: (env.HETZNER_CLOUD_API_URL ?? 'https://api.hetzner.cloud/v1').replace(/\/+$/, ''),
       hetzner: (env.HETZNER_API_URL ?? 'https://api.hetzner.com/v1').replace(/\/+$/, ''),
@@ -68,12 +74,13 @@ export function loadLimits(env: NodeJS.ProcessEnv = process.env): Limits {
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const readOnly = /^(1|true|yes)$/i.test(env.HETZNER_READ_ONLY ?? '');
+  const billed = !readOnly && /^(1|true|yes)$/i.test(env.HETZNER_ALLOW_BILLED ?? '');
   const projects = new Map<string, CloudProject>();
   for (const [key, value] of Object.entries(env)) {
     if (!value?.trim()) continue;
-    if (key === TOKEN_PREFIX) projects.set('default', { token: value.trim(), writes: !readOnly });
+    if (key === TOKEN_PREFIX) projects.set('default', { token: value.trim(), writes: !readOnly, billed });
     else if (key.startsWith(`${TOKEN_PREFIX}_`)) {
-      projects.set(key.slice(TOKEN_PREFIX.length + 1).toLowerCase(), { token: value.trim(), writes: !readOnly });
+      projects.set(key.slice(TOKEN_PREFIX.length + 1).toLowerCase(), { token: value.trim(), writes: !readOnly, billed });
     }
   }
 
@@ -91,7 +98,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const robots = new Map<string, RobotAccount>();
   const robotUser = env.HETZNER_ROBOT_USER?.trim();
   const robotPassword = env.HETZNER_ROBOT_PASSWORD;
-  if (robotUser && robotPassword) robots.set('default', { user: robotUser, password: robotPassword, writes: !readOnly });
+  if (robotUser && robotPassword) robots.set('default', { user: robotUser, password: robotPassword, writes: !readOnly, billed });
 
   return {
     ...loadLimits(env),

@@ -16,7 +16,9 @@ against the API. Three tools cover all 327 operations:
 | `hetzner_execute` | Run JavaScript that may also POST, PUT and DELETE. | yes |
 
 Reads and writes are separate tools, so a client can auto-approve `hetzner_query` and still
-ask before every `hetzner_execute`.
+ask before every `hetzner_execute`. Requests that cost money are refused until you switch
+them on, and both billed and destructive requests wait for an approval that shows the price
+or the affected resource ([details](#cost-and-damage-guard)).
 
 Why code mode: one call can chain requests, follow pagination and return only the fields
 that matter, instead of pushing whole API responses through the model. New Hetzner
@@ -90,6 +92,8 @@ minutes after three failed logins, so check the credentials before retrying.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HETZNER_READ_ONLY` | off | `1` removes `hetzner_execute` and blocks every non-GET request |
+| `HETZNER_ALLOW_BILLED` | off | `1` allows requests that cost money (see [guard](#cost-and-damage-guard)) |
+| `HETZNER_SKIP_CONFIRMATION` | off | `1` sends billed and destructive requests without asking first |
 | `HETZNER_EXECUTE_TIMEOUT_SECONDS` | 120 | Maximum runtime of one code run |
 | `HETZNER_REQUEST_TIMEOUT_SECONDS` | 30 | Timeout of a single API call |
 | `HETZNER_MAX_REQUESTS_PER_RUN` | 200 | API calls allowed per code run |
@@ -135,6 +139,43 @@ POST /servers was not sent, it does not match the API reference:
 For Robot, which publishes no schemas, the operation and the top-level input names are
 checked. `hetzner.request({ ..., validate: false })` skips the check if the reference is wrong.
 
+## Cost and damage guard
+
+`hetzner_execute` treats two kinds of requests specially.
+
+**Billed requests** create something Hetzner charges for or raise a price: creating
+servers, volumes, load balancers, floating and primary IPs, snapshots and Storage Boxes,
+changing a server, load balancer or Storage Box type, enlarging a volume, enabling backups,
+and ordering through Robot. They are **refused** unless `HETZNER_ALLOW_BILLED=1` is set
+(hosted mode: `"billed": true` on the tenant).
+
+**Destructive requests** delete data or replace a whole configuration: every `DELETE`,
+rebuilding a server, disabling backups, rolling back a Storage Box snapshot, importing a
+zone file, replacing a firewall rule set, and in Robot cancellations, OS installations and
+the server firewall.
+
+Both kinds are not sent on the first attempt. The server works out what the request does
+and, for billed Cloud requests, the price from Hetzner's price list:
+
+```
+POST /servers was NOT sent, it needs the user's approval first. This request creates a
+server, billed per hour until it is deleted (also while powered off). Price: server type
+cx23 in nbg1: 4.15 EUR/month, 0.0071 EUR/hour (incl. 19% VAT).
+```
+
+How the approval happens depends on the client:
+
+- Clients that support MCP elicitation show this text in a dialog and the person decides
+  (approve, approve everything else in this run, or decline). The model cannot answer it.
+- Otherwise the text goes back to the model, which has to tell the user and repeat the call
+  with `confirmed: true`. That argument is visible in the client's own approval prompt for
+  the tool call.
+
+The second path relies on the model reporting honestly and on you reading the approval
+prompt; it is a speed bump, not a lock. The billing switch is the hard limit: with it off,
+no code can create a billable resource. Prices for Robot orders and Storage Boxes are not
+looked up. `HETZNER_SKIP_CONFIRMATION=1` turns the approval step off for automation.
+
 ## Hosted mode (claude.ai connector for a team)
 
 `hetzner-code-mcp --http` runs the server as a remote MCP endpoint (Streamable HTTP):
@@ -160,7 +201,7 @@ API-token requests. The connect pages are in German.
 {
   "tenants": [
     { "id": "prod", "name": "Production", "type": "cloud", "writes": false },
-    { "id": "staging", "name": "Staging", "type": "cloud", "writes": true },
+    { "id": "staging", "name": "Staging", "type": "cloud", "writes": true, "billed": true },
     { "id": "dedicated", "name": "Dedicated servers", "type": "robot", "writes": false }
   ]
 }
@@ -172,6 +213,7 @@ API-token requests. The connect pages are in German.
 | `name` | Shown on the connect page and to the model. |
 | `type` | `cloud` (default): a Cloud project, connected with an API token. `robot`: a Robot account, connected with a webservice user. |
 | `writes` | `true` allows POST/PUT/DELETE for this tenant. Default: only GET requests pass, whatever the stored token could do. |
+| `billed` | `true` (with `writes`) allows requests that cost money. Default: refused. Approval in hosted mode works through `confirmed: true`. |
 
 A Hetzner token does not say which project it belongs to, so the server cannot verify that
 a token stored under "Production" really is from that project.
@@ -226,10 +268,11 @@ set the two `HETZNER_MCP_CF_ACCESS_*` variables. Leave `/mcp`, `/token`, `/regis
   forever), 256 MB of memory, and a cap on API calls per run.
 - **Writes need the second tool**, and can be switched off per installation
   (`HETZNER_READ_ONLY`) or per tenant (`writes` in hosted mode).
+- **Billed requests are off by default** and, like destructive ones, wait for an approval
+  ([guard](#cost-and-damage-guard)).
 
-What it does not do: there is no cost guard and no confirmation step inside the server.
-`hetzner_execute` can create billable resources and delete data; the confirmation is the
-approval prompt of your MCP client. Use read-only tokens where you only want to look.
+Use read-only tokens where you only want to look: that is enforced by Hetzner, not by this
+server.
 
 ## Updating the API reference
 

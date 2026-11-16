@@ -38,6 +38,12 @@ interface Indexed {
 
 export type Validator = (api: ApiName, method: string, path: string, queryKeys: string[], body: unknown) => string[];
 
+export interface Reference {
+  validate: Validator;
+  /** The operation a request addresses, if the reference knows it. */
+  match(api: ApiName, method: string, path: string): { operationId: string; path: string } | undefined;
+}
+
 const isParam = (segment: string): boolean => segment.startsWith('{') && segment.endsWith('}');
 const split = (path: string): string[] => path.split('/').filter(Boolean);
 
@@ -140,7 +146,7 @@ function robotInputs(op: Operation): Set<string> | undefined {
   return names.length ? new Set(names) : undefined;
 }
 
-export function createValidator(specPath: string): Validator {
+export function createReference(specPath: string): Reference {
   const spec = JSON.parse(readFileSync(specPath, 'utf8')) as { operations: Operation[] };
   const index: Indexed[] = spec.operations.map((op) => {
     const segments = split(op.path);
@@ -152,10 +158,14 @@ export function createValidator(specPath: string): Validator {
       .filter((e) => e.op.api === api && e.segments.length === segments.length && e.segments.every((s, i) => isParam(s) || s === segments[i]))
       .sort((a, b) => b.literals - a.literals);
 
-  return (api, method, path, queryKeys, body) => {
+  const candidates = (api: ApiName, path: string): { segments: string[]; best: Indexed[] } => {
     const segments = split(path.replace(/\.(json|yaml)$/, ''));
     const sameShape = matchPath(api, segments);
-    const best = sameShape.filter((e) => e.literals === sameShape[0]?.literals);
+    return { segments, best: sameShape.filter((e) => e.literals === sameShape[0]?.literals) };
+  };
+
+  const validate: Validator = (api, method, path, queryKeys, body) => {
+    const { segments, best } = candidates(api, path);
     const entry = best.find((e) => e.op.method === method);
 
     if (!entry) {
@@ -197,6 +207,14 @@ export function createValidator(specPath: string): Validator {
         else checkSchema(op.requestBody, bodyObject ?? {}, 'body', problems);
       }
     }
-    return problems.length ? problems.map((p) => `${p}`).concat(`See describe('${op.operationId}') in hetzner_search for all inputs.`) : [];
+    return problems.length ? problems.concat(`See describe('${op.operationId}') in hetzner_search for all inputs.`) : [];
+  };
+
+  return {
+    validate,
+    match: (api, method, path) => {
+      const op = candidates(api, path).best.find((e) => e.op.method === method)?.op;
+      return op && { operationId: op.operationId, path: op.path };
+    },
   };
 }

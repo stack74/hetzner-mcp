@@ -318,9 +318,9 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
       if (connection.broken_reason) continue;
       const tenant = tenantById.get(connection.tenant_id)!;
       if (tenant.type === "cloud" && "token" in connection.secret) {
-        projects.set(tenant.id, { token: connection.secret.token, writes: tenant.writes, label: tenant.name });
+        projects.set(tenant.id, { token: connection.secret.token, writes: tenant.writes, billed: tenant.billed, label: tenant.name });
       } else if (tenant.type === "robot" && "user" in connection.secret) {
-        robots.set(tenant.id, { ...connection.secret, writes: tenant.writes, label: tenant.name });
+        robots.set(tenant.id, { ...connection.secret, writes: tenant.writes, billed: tenant.billed, label: tenant.name });
       }
     }
     const requestConfig: Config = {
@@ -337,6 +337,7 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
       ...(icons ? { icons } : {}),
       missingProject: `No Hetzner Cloud project is connected for this user. ${connectHint}`,
       missingRobot: `No Hetzner Robot account is connected for this user. ${connectHint}`,
+      billedHint: 'The operator of this server enables them per tenant with "billed": true in the tenant configuration.',
       onRejected: (_kind, name) => {
         console.error(`Tenant ${name}: Hetzner rejected the stored credentials`);
         store.markConnectionBroken(grantId, name, "rejected");
@@ -407,7 +408,7 @@ export async function startHttpServer(): Promise<void> {
       `${SERVER_NAME} v${SERVER_VERSION} listening on ${config.host}:${config.port} | MCP endpoint ${config.mcpUrl.href}` +
         `${config.cloudflareAccess ? ` | /connect behind Cloudflare Access (${config.cloudflareAccess.issuer})` : ""}` +
         ` | ${config.tenants.length} tenant(s): ` +
-        config.tenants.map((t) => `${t.id} (${t.type}, ${t.writes ? "rw" : "ro"})`).join(", "),
+        config.tenants.map((t) => `${t.id} (${t.type}, ${t.writes ? (t.billed ? "rw+billed" : "rw") : "ro"})`).join(", "),
     );
   });
 

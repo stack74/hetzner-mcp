@@ -18,6 +18,8 @@ export interface TenantConfig {
   type: "cloud" | "robot";
   /** Allow POST/PUT/DELETE against this tenant. Default: read-only. */
   writes: boolean;
+  /** Allow requests that create billable resources or raise a price. Needs writes. Default: off. */
+  billed: boolean;
 }
 
 export interface HostedConfig {
@@ -76,6 +78,7 @@ function parseTenants(raw: string, source: string): TenantConfig[] {
       name: typeof t.name === "string" && t.name.trim() ? t.name.trim() : id,
       type,
       writes: t.writes === true,
+      billed: t.writes === true && t.billed === true,
     };
   });
 }

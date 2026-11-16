@@ -6,10 +6,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Icon } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { performRequest, ApiError, type Credentials, type RequestOptions } from './client.js';
+import { performRequest, ApiError, type Credentials, type Guard, type RequestOptions } from './client.js';
 import { resolveProject, resolveRobot, SERVER_NAME, SERVER_VERSION, type Config } from './config.js';
-import { runSandbox, SPEC_PATH, type SandboxResult } from './sandbox.js';
-import { createValidator, type Validator } from './validate.js';
+import { classify, describePrice, describeTarget, type Pricing } from './guard.js';
+import { runSandbox, SPEC_PATH, type SandboxControl, type SandboxResult } from './sandbox.js';
+import { createReference, type Reference } from './validate.js';
 
 export interface ServerOptions {
   /** Appended to the server instructions (hosted mode: who is connected, where to connect). */
@@ -21,10 +22,12 @@ export interface ServerOptions {
   missingRobot?: string;
   /** The API rejected stored credentials (HTTP 401). */
   onRejected?: (kind: 'cloud' | 'robot', name: string) => void;
+  /** How an operator switches billed requests on, for the error message. */
+  billedHint?: string;
 }
 
-let sharedValidator: Validator | undefined;
-const validator = (): Validator => (sharedValidator ??= createValidator(SPEC_PATH));
+let sharedReference: Reference | undefined;
+const reference = (): Reference => (sharedReference ??= createReference(SPEC_PATH));
 
 function toToolResult(run: SandboxResult, limit: number) {
   let text = run.result;
@@ -110,6 +113,16 @@ sent form-encoded, nested values become rules[input][0][action]=accept.`;
           code: z.string().min(1).describe('JavaScript: an async arrow function whose return value is the result. Return only the fields you need.'),
           project: projectSchema,
           ...(robotNames.length > 1 ? { robot_account: robotSchema } : {}),
+          ...(tool.allowWrites && config.confirm
+            ? {
+                confirmed: z
+                  .boolean()
+                  .optional()
+                  .describe(
+                    'Set true only after the user approved the billed or destructive requests of exactly this code. Without it such requests are not sent; the result says what they would do and cost.',
+                  ),
+              }
+            : {}),
         },
         annotations: {
           readOnlyHint: !tool.allowWrites,
@@ -121,15 +134,16 @@ sent form-encoded, nested values become rules[input][0][action]=accept.`;
       async (args) => {
         const { code, project } = args;
         const robotAccount = (args as { robot_account?: string }).robot_account;
+        const confirmed = (args as { confirmed?: boolean }).confirmed === true;
         const fail = (message: string) => ({ content: [{ type: 'text' as const, text: message }], isError: true });
 
         // An explicitly named project or account must exist. Without a name the run may
         // still use only the other side, so the error is kept until a call needs it.
-        const credentials: Credentials = { cloud: { writes: false }, robot: { writes: false } };
+        const credentials: Credentials = { cloud: { writes: false, billed: false }, robot: { writes: false, billed: false } };
         try {
           const p = resolveProject(config, project, options.missingProject);
           const name = (project?.trim().toLowerCase() || config.defaultProject)!;
-          credentials.cloud = { value: { token: p.token }, writes: p.writes, onRejected: () => options.onRejected?.('cloud', name) };
+          credentials.cloud = { value: { token: p.token }, writes: p.writes, billed: p.billed, onRejected: () => options.onRejected?.('cloud', name) };
         } catch (error) {
           if (project) return fail((error as Error).message);
           credentials.cloud.error = (error as Error).message;
@@ -137,23 +151,98 @@ sent form-encoded, nested values become rules[input][0][action]=accept.`;
         try {
           const r = resolveRobot(config, robotAccount, options.missingRobot);
           const name = (robotAccount?.trim().toLowerCase() || config.defaultRobot)!;
-          credentials.robot = { value: { user: r.user, password: r.password }, writes: r.writes, onRejected: () => options.onRejected?.('robot', name) };
+          credentials.robot = { value: { user: r.user, password: r.password }, writes: r.writes, billed: r.billed, onRejected: () => options.onRejected?.('robot', name) };
         } catch (error) {
           if (robotAccount) return fail((error as Error).message);
           credentials.robot.error = (error as Error).message;
         }
         if (!credentials.cloud.value && !credentials.robot.value) return fail(credentials.cloud.error!);
 
+        // Reads the guard needs for its previews; never guarded themselves.
+        const read = async (api: string, path: string): Promise<unknown> =>
+          JSON.parse(await performRequest(config, credentials, { path, api, validate: false }, false));
+        let pricing: Promise<Pricing | undefined> | undefined;
+        let approvedAll = false;
+
+        const guardFor = (control: SandboxControl): Guard => async (write) => {
+          const hit = classify(write.api, write.method, write.operation);
+          if (!hit) return;
+          const label = `${write.method} ${write.path}`;
+          if (hit.kind === 'billed' && !write.access.billed) {
+            throw new ApiError({
+              message: `${label} was NOT sent: it ${hit.effect}, and billed requests are switched off for this ${write.api === 'robot' ? 'Robot account' : 'project'}. ${options.billedHint ?? 'The operator enables them with HETZNER_ALLOW_BILLED=1 in the MCP server environment.'} Tell the user; do not look for another way to create the resource.`,
+              code: 'billing_disabled',
+            });
+          }
+          if (!config.confirm || approvedAll) return;
+
+          const canAsk = Boolean(server.server.getClientCapabilities()?.elicitation);
+          if (confirmed && !canAsk) return;
+
+          // What exactly is affected, and what it costs.
+          const details: string[] = [];
+          if (hit.kind === 'billed' && write.api !== 'robot' && write.operation) {
+            pricing ??= read('cloud', '/pricing').then(
+              (json) => (json as { pricing?: Pricing }).pricing,
+              () => undefined,
+            );
+            const price = describePrice(write.operation.operationId, write.body, (await pricing) ?? {});
+            details.push(price ? `Price: ${price}.` : 'The price could not be determined; see GET /pricing.');
+          }
+          if (write.method === 'DELETE' && write.api !== 'robot') {
+            const target = await read(write.api, write.path).then(describeTarget, () => undefined);
+            if (target) details.push(`Affected: ${target}.`);
+          }
+          const summary = `${label} ${hit.effect}.${details.length ? ` ${details.join(' ')}` : ''}`;
+
+          if (canAsk) {
+            let decision: unknown;
+            try {
+              const answer = await control.suspend(() =>
+                server.server.elicitInput(
+                  {
+                    message: `Hetzner: ${summary}`,
+                    requestedSchema: {
+                      type: 'object',
+                      properties: {
+                        decision: {
+                          type: 'string',
+                          title: 'Send this request?',
+                          enum: ['approve', 'approve_all', 'decline'],
+                          enumNames: ['Approve', 'Approve this and all further requests of this run', 'Decline'],
+                        },
+                      },
+                      required: ['decision'],
+                    },
+                  },
+                  { timeout: 10 * 60 * 1000 },
+                ),
+              );
+              decision = answer.action === 'accept' ? answer.content?.decision : 'decline';
+            } catch (error) {
+              throw new ApiError({ message: `${label} was NOT sent: the approval dialog failed (${error instanceof Error ? error.message : String(error)}).`, code: 'confirmation_failed' });
+            }
+            if (decision === 'approve_all') approvedAll = true;
+            if (decision === 'approve' || decision === 'approve_all') return;
+            throw new ApiError({ message: `${label} was NOT sent: the user declined it. Do not retry it without asking.`, code: 'declined' });
+          }
+
+          throw new ApiError({
+            message: `${label} was NOT sent, it needs the user's approval first. This request ${hit.effect}.${details.length ? ` ${details.join(' ')}` : ''}\nTell the user exactly this. Only after they agree, run the same code again with the tool argument confirmed: true.`,
+            code: 'confirmation_required',
+          });
+        };
+
         let requestCount = 0;
         const run = await runSandbox({
           mode: 'api',
           code,
           timeoutMs: config.executeTimeoutMs,
-          onRequest: async (payload) => {
+          onRequest: async (payload, control) => {
             if (++requestCount > config.maxRequestsPerRun) {
               throw new ApiError({ message: `Request limit of ${config.maxRequestsPerRun} API calls per run reached.`, code: 'request_limit' });
             }
-            return performRequest(config, credentials, JSON.parse(payload) as RequestOptions, tool.allowWrites, validator());
+            return performRequest(config, credentials, JSON.parse(payload) as RequestOptions, tool.allowWrites, reference(), tool.allowWrites ? guardFor(control) : undefined);
           },
         });
         return toToolResult(run, config.maxOutputChars);
@@ -219,6 +308,8 @@ Examples:
       title: 'Change resources through the Hetzner API',
       allowWrites: true,
       description: `Run JavaScript that changes Hetzner resources (POST, PUT, DELETE as well as GET). Changes are real and immediate: they can create billable resources, cause downtime or delete data permanently. Through \`robot\` this includes ordering and cancelling dedicated servers, hardware resets, and firewall rules that can lock everyone out of a server (POST /firewall/{server-number} replaces the whole rule set: read it first and send all rules back, except output rules named "Block mail ports", which Hetzner prepends itself and would duplicate; the update is asynchronous, poll until status is no longer "in process"). Look the operation up with hetzner_search first, use hetzner_query for pure reads, and act only on resources the user named.
+
+Guard: requests that cost money (creating servers, volumes, load balancers, IPs, snapshots, Storage Boxes, type changes, backups, Robot orders) are refused unless the operator switched billed requests on. Billed requests and destructive ones (every DELETE, rebuilding a server, replacing a firewall rule set or a DNS zone, Robot cancellations and OS installations) are not sent on the first attempt: the result states what they do and the price. Report that to the user and wait for their answer.
 
 ${API_REFERENCE}
 

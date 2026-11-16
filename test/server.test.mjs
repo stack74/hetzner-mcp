@@ -4,6 +4,7 @@ import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const ENTRY = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 const requests = [];
@@ -42,6 +43,12 @@ before(async () => {
         return json(200, { action: { id: 7, command: 'reboot_server', status: actionPolls > 1 ? 'success' : 'running', progress: 50 } });
       }
       if (url.pathname === '/v1/servers/2' && req.method === 'DELETE') return json(204);
+      if (url.pathname === '/v1/servers/2' && req.method === 'GET') return json(200, { server: { id: 2, name: 'old-box', created: '2024-03-01T10:00:00+00:00', server_type: { name: 'cx23' } } });
+      if (url.pathname === '/v1/servers' && req.method === 'POST') return json(201, { server: { id: 9, name: JSON.parse(body).name }, action: { id: 7, status: 'running' } });
+      if (url.pathname === '/v1/pricing') {
+        return json(200, { pricing: { currency: 'EUR', vat_rate: '19.00', volume: { price_per_gb_month: { net: '0.044', gross: '0.05236' } },
+          server_types: [{ id: 1, name: 'cx23', prices: [{ location: 'nbg1', price_hourly: { gross: '0.0071' }, price_monthly: { gross: '4.15' } }, { location: 'hel1', price_hourly: { gross: '0.0080' }, price_monthly: { gross: '4.75' } }] }] } });
+      }
       if (url.pathname === '/v1/storage_boxes') return json(200, { storage_boxes: [], host: req.headers.host });
       if (url.pathname === '/v1/servers/999') {
         return json(404, { error: { code: 'not_found', message: 'server with ID 999 not found', details: null } });
@@ -54,8 +61,9 @@ before(async () => {
 });
 after(() => mock.close());
 
-async function connect(env = {}) {
-  const client = new Client({ name: 'test', version: '1.0.0' });
+async function connect(env = {}, onElicit) {
+  const client = new Client({ name: 'test', version: '1.0.0' }, onElicit ? { capabilities: { elicitation: {} } } : undefined);
+  if (onElicit) client.setRequestHandler(ElicitRequestSchema, async (request) => onElicit(request.params));
   await client.connect(
     new StdioClientTransport({
       command: process.execPath,
@@ -65,7 +73,7 @@ async function connect(env = {}) {
     }),
   );
   const call = async (name, args) => {
-    const res = await client.callTool({ name, arguments: args });
+    const res = await client.callTool({ name, arguments: args }, undefined, { timeout: 20000 });
     return { text: res.content[0].text, isError: res.isError === true };
   };
   return { client, call };
@@ -141,7 +149,7 @@ test('query blocks writes, execute performs them', async () => {
   const caught = await call('hetzner_query', { code: "async () => { try { await hetzner.post('/servers', {}); } catch (e) { return e.code; } }" });
   assert.equal(JSON.parse(caught.text), 'read_only');
 
-  const deleted = await call('hetzner_execute', { code: "async () => hetzner.delete('/servers/2')" });
+  const deleted = await call('hetzner_execute', { code: "async () => hetzner.delete('/servers/2')", confirmed: true });
   assert.equal(deleted.isError, false);
   assert.equal(deleted.text, 'null');
   assert.equal(requests.at(-1).method, 'DELETE');
@@ -280,7 +288,7 @@ test('robot bodies are form-encoded with nested keys, and writes need hetzner_ex
   const blocked = await call('hetzner_query', { code });
   assert.equal(blocked.isError, true);
   assert.equal(requests.length, 0);
-  const fw = JSON.parse((await call('hetzner_execute', { code })).text);
+  const fw = JSON.parse((await call('hetzner_execute', { code, confirmed: true })).text);
   assert.equal(fw.contentType, 'application/x-www-form-urlencoded');
   assert.deepEqual(Object.fromEntries(new URLSearchParams(fw.raw)), {
     status: 'active',
@@ -342,4 +350,90 @@ test('version constant matches package.json and --version', async () => {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(execFileSync(process.execPath, [ENTRY, '--version'], { encoding: 'utf8' }).trim(), pkg.version);
   assert.match(execFileSync(process.execPath, [ENTRY, '--help'], { encoding: 'utf8' }), /HETZNER_API_TOKEN/);
+});
+
+const CREATE = "async () => (await hetzner.post('/servers', { name: 'web-1', server_type: 'cx23', image: 'ubuntu-24.04', location: 'nbg1' })).server.id";
+const writes = () => requests.filter((r) => r.method !== 'GET');
+
+test('billed requests are refused unless the operator allows them', async () => {
+  const { client, call } = await connect({ HETZNER_API_TOKEN: 'tok' });
+  requests.length = 0;
+  for (const confirmed of [false, true]) {
+    const res = await call('hetzner_execute', { code: CREATE, confirmed });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /was NOT sent: it creates a server.*billed requests are switched off.*HETZNER_ALLOW_BILLED=1/s);
+  }
+  assert.equal(requests.length, 0);
+  const code = await call('hetzner_execute', { code: `async () => { try { await (${CREATE})(); } catch (e) { return e.code; } }` });
+  assert.equal(JSON.parse(code.text), 'billing_disabled');
+  // Writes that cost nothing are unaffected.
+  const reboot = await call('hetzner_execute', { code: "async () => (await hetzner.post('/servers/1/actions/reboot')).action.command" });
+  assert.equal(JSON.parse(reboot.text), 'reboot_server');
+  await client.close();
+});
+
+test('allowed billed requests first report the price and wait for confirmation', async () => {
+  const { client, call } = await connect({ HETZNER_API_TOKEN: 'tok', HETZNER_ALLOW_BILLED: '1' });
+  requests.length = 0;
+  const first = await call('hetzner_execute', { code: CREATE });
+  assert.equal(first.isError, true);
+  assert.match(first.text, /POST \/servers was NOT sent, it needs the user's approval first/);
+  assert.match(first.text, /Price: server type cx23 in nbg1: 4\.15 EUR\/month, 0\.0071 EUR\/hour \(incl\. 19% VAT\)/);
+  assert.match(first.text, /confirmed: true/);
+  assert.equal(writes().length, 0);
+
+  const second = await call('hetzner_execute', { code: CREATE, confirmed: true });
+  assert.equal(second.text, '9');
+  assert.equal(writes().length, 1);
+
+  const range = await call('hetzner_execute', { code: "async () => hetzner.post('/servers', { name: 'a', server_type: 'cx23', image: 'x' })" });
+  assert.match(range.text, /4\.15 to 4\.75 EUR\/month depending on the location/);
+  await client.close();
+});
+
+test('destructive requests name what they affect and wait for confirmation', async () => {
+  const { client, call } = await connect({ HETZNER_API_TOKEN: 'tok', ...ROBOT });
+  requests.length = 0;
+  const del = await call('hetzner_execute', { code: "async () => hetzner.delete('/servers/2')" });
+  assert.equal(del.isError, true);
+  assert.match(del.text, /DELETE \/servers\/2 was NOT sent.*deletes the resource permanently.*Affected: server "old-box" \(id 2\) type cx23 created 2024-03-01/s);
+  const firewall = await call('hetzner_execute', { code: "async () => robot.post('/firewall/321', { status: 'active', whitelist_hos: true, rules: { input: [] } })" });
+  assert.match(firewall.text, /replaces the whole firewall configuration.*lock everyone out/s);
+  assert.equal(writes().length, 0);
+  await client.close();
+
+  const skip = await connect({ HETZNER_API_TOKEN: 'tok', HETZNER_SKIP_CONFIRMATION: '1' });
+  const direct = await skip.call('hetzner_execute', { code: "async () => hetzner.delete('/servers/2')" });
+  assert.equal(direct.text, 'null');
+  const { tools } = await skip.client.listTools();
+  assert.equal('confirmed' in tools.find((t) => t.name === 'hetzner_execute').inputSchema.properties, false);
+  await skip.client.close();
+});
+
+test('clients with an approval dialog ask the person instead of trusting the confirmed argument', async () => {
+  const asked = [];
+  let answer = { action: 'accept', content: { decision: 'decline' } };
+  const { client, call } = await connect({ HETZNER_API_TOKEN: 'tok', HETZNER_ALLOW_BILLED: '1' }, (params) => {
+    asked.push(params.message);
+    return answer;
+  });
+  requests.length = 0;
+  const declined = await call('hetzner_execute', { code: CREATE, confirmed: true });
+  assert.equal(declined.isError, true);
+  assert.match(declined.text, /the user declined it/);
+  assert.equal(writes().length, 0);
+  assert.match(asked[0], /POST \/servers creates a server.*Price: server type cx23 in nbg1: 4\.15 EUR\/month/s);
+
+  answer = { action: 'cancel' };
+  assert.match((await call('hetzner_execute', { code: CREATE })).text, /the user declined it/);
+
+  answer = { action: 'accept', content: { decision: 'approve' } };
+  assert.equal((await call('hetzner_execute', { code: CREATE })).text, '9');
+
+  asked.length = 0;
+  answer = { action: 'accept', content: { decision: 'approve_all' } };
+  const both = await call('hetzner_execute', { code: `async () => { await (${CREATE})(); await hetzner.delete('/servers/2'); return 'done'; }` });
+  assert.equal(JSON.parse(both.text), 'done');
+  assert.equal(asked.length, 1, 'approve_all covers the rest of the run');
+  await client.close();
 });

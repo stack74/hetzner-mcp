@@ -24,7 +24,12 @@ export interface SandboxOptions {
   code: string;
   timeoutMs: number;
   /** Handles one request() call; receives the JSON-encoded options, returns the raw body. */
-  onRequest?: (payload: string) => Promise<string>;
+  onRequest?: (payload: string, control: SandboxControl) => Promise<string>;
+}
+
+export interface SandboxControl {
+  /** Runs fn with the run's time limit paused, e.g. while a person is asked for approval. */
+  suspend<T>(fn: () => Promise<T>): Promise<T>;
 }
 
 type ChildMessage =
@@ -49,13 +54,31 @@ export function runSandbox(options: SandboxOptions): Promise<SandboxResult> {
       resolve(result);
     };
 
-    const timer = setTimeout(() => {
-      settle({
-        ok: false,
-        result: `Timed out after ${Math.round(options.timeoutMs / 1000)}s. Split the work into smaller steps; requests already sent were not rolled back.`,
-        logs: '',
-      });
-    }, options.timeoutMs);
+    let remaining = options.timeoutMs;
+    let armedAt = Date.now();
+    let timer: NodeJS.Timeout | undefined;
+    const arm = (): void => {
+      armedAt = Date.now();
+      timer = setTimeout(() => {
+        settle({
+          ok: false,
+          result: `Timed out after ${Math.round(options.timeoutMs / 1000)}s. Split the work into smaller steps; requests already sent were not rolled back.`,
+          logs: '',
+        });
+      }, Math.max(remaining, 0));
+    };
+    const control: SandboxControl = {
+      suspend: async (fn) => {
+        clearTimeout(timer);
+        remaining -= Date.now() - armedAt;
+        try {
+          return await fn();
+        } finally {
+          if (!settled) arm();
+        }
+      },
+    };
+    arm();
 
     const send = (message: unknown): void => {
       if (!settled && child.connected) child.send(message as object, () => undefined);
@@ -73,7 +96,7 @@ export function runSandbox(options: SandboxOptions): Promise<SandboxResult> {
           reply(false, JSON.stringify({ message: 'API access is not available in this tool.' }));
           return;
         }
-        options.onRequest(message.payload).then(
+        options.onRequest(message.payload, control).then(
           (body) => reply(true, body),
           (error: unknown) =>
             reply(false, JSON.stringify(error instanceof ApiError ? error.info : { message: error instanceof Error ? error.message : String(error) })),

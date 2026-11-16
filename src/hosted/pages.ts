@@ -61,7 +61,7 @@ const kindLabel = (tenant: TenantConfig): string => (tenant.type === "robot" ? "
 function tenantRow(sessionId: string, tenant: TenantConfig, connection: ConnectionRow | undefined): string {
   const base = `/connect/${encodeURIComponent(sessionId)}/tenants/${encodeURIComponent(tenant.id)}`;
   const badges =
-    `<span class="badge">${kindLabel(tenant)}</span>` + `<span class="badge">${tenant.writes ? "Lesen &amp; Schreiben" : "Nur lesen"}</span>`;
+    `<span class="badge">${kindLabel(tenant)}</span>` + `<span class="badge">${tenant.writes ? (tenant.billed ? "Lesen, Schreiben &amp; Kostenpflichtiges" : "Lesen &amp; Schreiben") : "Nur lesen"}</span>`;
   const connectButton = (label: string, primary: boolean): string =>
     `<form method="get" action="${base}/key"><button${primary ? ' class="primary"' : ""}>${label}</button></form>`;
   const disconnect = `<form method="post" action="${base}/disconnect"><button class="link">Trennen</button></form>`;

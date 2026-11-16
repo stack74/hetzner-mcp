@@ -1,5 +1,5 @@
 import { SERVER_NAME, SERVER_VERSION, type ApiName, type Limits } from './config.js';
-import type { Validator } from './validate.js';
+import type { Reference } from './validate.js';
 
 /** First path segments that live on api.hetzner.com instead of api.hetzner.cloud. */
 const HETZNER_API_SEGMENTS = new Set(['storage_boxes', 'storage_box_types']);
@@ -79,9 +79,25 @@ export interface Access<T> {
   error?: string;
   /** false: only GET requests are allowed for this side, also in hetzner_execute. */
   writes: boolean;
+  /** true: billed requests are allowed for this side. */
+  billed: boolean;
   /** Called when the API rejects the credentials (HTTP 401). */
   onRejected?: () => void;
 }
+
+/** A write request that passed validation and is about to be sent. */
+export interface PendingWrite {
+  api: ApiName;
+  method: string;
+  /** Path relative to the API root, without query string. */
+  path: string;
+  body: unknown;
+  operation: { operationId: string; path: string } | undefined;
+  access: Access<unknown>;
+}
+
+/** Throws an ApiError to keep a write from being sent. */
+export type Guard = (write: PendingWrite) => Promise<void>;
 
 export interface Credentials {
   cloud: Access<{ token: string }>;
@@ -97,7 +113,8 @@ export async function performRequest(
   credentials: Credentials,
   opts: RequestOptions,
   allowWrites: boolean,
-  validate?: Validator,
+  reference?: Reference,
+  guard?: Guard,
 ): Promise<string> {
   const method = String(opts.method ?? 'GET').toUpperCase();
   if (!METHODS.has(method)) fail(`Unsupported HTTP method "${method}".`);
@@ -108,9 +125,9 @@ export async function performRequest(
   const { url, api } = buildUrl(config, opts);
   const hasBody = opts.body !== undefined && opts.body !== null && method !== 'GET';
 
-  if (validate && opts.validate !== false) {
-    const basePath = new URL(config.baseUrls[api]).pathname.replace(/\/$/, '');
-    const problems = validate(api, method, url.pathname.slice(basePath.length), [...new Set(url.searchParams.keys())], opts.body);
+  const relativePath = url.pathname.slice(new URL(config.baseUrls[api]).pathname.replace(/\/$/, '').length);
+  if (reference && opts.validate !== false) {
+    const problems = reference.validate(api, method, relativePath, [...new Set(url.searchParams.keys())], opts.body);
     if (problems.length) {
       fail(
         `${method} ${opts.path} was not sent, it does not match the API reference:\n- ${problems.join('\n- ')}\nIf the reference is wrong, pass validate: false in hetzner.request({ ... }).`,
@@ -124,6 +141,9 @@ export async function performRequest(
     fail(`${method} blocked: this ${api === 'robot' ? 'Robot account' : 'project'} is read-only, only GET requests are allowed.`, { code: 'read_only' });
   }
   if (!access.value) fail(access.error ?? 'No credentials configured.', { code: 'not_configured' });
+  if (method !== 'GET' && guard) {
+    await guard({ api, method, path: relativePath, body: opts.body, operation: reference?.match(api, method, relativePath), access });
+  }
   const authorization =
     api === 'robot'
       ? `Basic ${Buffer.from(`${credentials.robot.value!.user}:${credentials.robot.value!.password}`).toString('base64')}`
