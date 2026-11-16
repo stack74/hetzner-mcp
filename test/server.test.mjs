@@ -288,7 +288,7 @@ test('robot bodies are form-encoded with nested keys, and writes need hetzner_ex
   const blocked = await call('hetzner_query', { code });
   assert.equal(blocked.isError, true);
   assert.equal(requests.length, 0);
-  const fw = JSON.parse((await call('hetzner_execute', { code, confirmed: true })).text);
+  const fw = JSON.parse((await call('hetzner_execute', { code })).text);
   assert.equal(fw.contentType, 'application/x-www-form-urlencoded');
   assert.deepEqual(Object.fromEntries(new URLSearchParams(fw.raw)), {
     status: 'active',
@@ -397,9 +397,10 @@ test('destructive requests name what they affect and wait for confirmation', asy
   const del = await call('hetzner_execute', { code: "async () => hetzner.delete('/servers/2')" });
   assert.equal(del.isError, true);
   assert.match(del.text, /DELETE \/servers\/2 was NOT sent.*deletes the resource permanently.*Affected: server "old-box" \(id 2\) type cx23 created 2024-03-01/s);
-  const firewall = await call('hetzner_execute', { code: "async () => robot.post('/firewall/321', { status: 'active', whitelist_hos: true, rules: { input: [] } })" });
-  assert.match(firewall.text, /replaces the whole firewall configuration.*lock everyone out/s);
   assert.equal(writes().length, 0);
+  // Configuration changes that cost nothing and lose no data are not held back.
+  const firewall = await call('hetzner_execute', { code: "async () => (await robot.post('/firewall/321', { status: 'active', whitelist_hos: true, rules: { input: [] } })).firewall.status" });
+  assert.equal(JSON.parse(firewall.text), 'in process');
   await client.close();
 
   const skip = await connect({ HETZNER_API_TOKEN: 'tok', HETZNER_SKIP_CONFIRMATION: '1' });
@@ -410,10 +411,10 @@ test('destructive requests name what they affect and wait for confirmation', asy
   await skip.client.close();
 });
 
-test('clients with an approval dialog ask the person instead of trusting the confirmed argument', async () => {
+test('with HETZNER_APPROVAL_DIALOG the person is asked instead of trusting the confirmed argument', async () => {
   const asked = [];
   let answer = { action: 'accept', content: { decision: 'decline' } };
-  const { client, call } = await connect({ HETZNER_API_TOKEN: 'tok', HETZNER_ALLOW_BILLED: '1' }, (params) => {
+  const { client, call } = await connect({ HETZNER_API_TOKEN: 'tok', HETZNER_ALLOW_BILLED: '1', HETZNER_APPROVAL_DIALOG: '1' }, (params) => {
     asked.push(params.message);
     return answer;
   });
@@ -435,5 +436,20 @@ test('clients with an approval dialog ask the person instead of trusting the con
   const both = await call('hetzner_execute', { code: `async () => { await (${CREATE})(); await hetzner.delete('/servers/2'); return 'done'; }` });
   assert.equal(JSON.parse(both.text), 'done');
   assert.equal(asked.length, 1, 'approve_all covers the rest of the run');
+  await client.close();
+});
+
+test('a client that dismisses dialogs on its own does not block approvals by default', async () => {
+  // Announces elicitation and answers "decline" without showing anything, as some clients do.
+  const asked = [];
+  const { client, call } = await connect({ HETZNER_API_TOKEN: 'tok', HETZNER_ALLOW_BILLED: '1' }, (params) => {
+    asked.push(params.message);
+    return { action: 'decline' };
+  });
+  const first = await call('hetzner_execute', { code: CREATE });
+  assert.match(first.text, /needs the user's approval first.*confirmed: true/s);
+  const second = await call('hetzner_execute', { code: CREATE, confirmed: true });
+  assert.equal(second.text, '9');
+  assert.equal(asked.length, 0);
   await client.close();
 });

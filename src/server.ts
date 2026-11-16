@@ -176,7 +176,7 @@ sent form-encoded, nested values become rules[input][0][action]=accept.`;
           }
           if (!config.confirm || approvedAll) return;
 
-          const canAsk = Boolean(server.server.getClientCapabilities()?.elicitation);
+          const canAsk = config.approvalDialog && Boolean(server.server.getClientCapabilities()?.elicitation);
           if (confirmed && !canAsk) return;
 
           // What exactly is affected, and what it costs.
@@ -309,7 +309,7 @@ Examples:
       allowWrites: true,
       description: `Run JavaScript that changes Hetzner resources (POST, PUT, DELETE as well as GET). Changes are real and immediate: they can create billable resources, cause downtime or delete data permanently. Through \`robot\` this includes ordering and cancelling dedicated servers, hardware resets, and firewall rules that can lock everyone out of a server (POST /firewall/{server-number} replaces the whole rule set: read it first and send all rules back, except output rules named "Block mail ports", which Hetzner prepends itself and would duplicate; the update is asynchronous, poll until status is no longer "in process"). Look the operation up with hetzner_search first, use hetzner_query for pure reads, and act only on resources the user named.
 
-Guard: requests that cost money (creating servers, volumes, load balancers, IPs, snapshots, Storage Boxes, type changes, backups, Robot orders) are refused unless the operator switched billed requests on. Billed requests and destructive ones (every DELETE, rebuilding a server, replacing a firewall rule set or a DNS zone, Robot cancellations and OS installations) are not sent on the first attempt: the result states what they do and the price. Report that to the user and wait for their answer.
+Guard: requests that cost money (creating servers, volumes, load balancers, IPs, snapshots, Storage Boxes, type changes, backups, Robot orders) are refused unless the operator switched billed requests on. Billed requests and destructive ones (every DELETE, rebuilding a server, disabling backups, importing a zone file, Robot cancellations and OS installations) are not sent on the first attempt: the result states what they do and the price. Report that to the user and wait for their answer.
 
 ${API_REFERENCE}
 

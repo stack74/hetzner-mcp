@@ -32,6 +32,12 @@ export interface Limits {
   maxRequestsPerRun: number;
   /** false: billed and destructive requests are sent without asking for approval. */
   confirm: boolean;
+  /**
+   * true: ask the person through the client's elicitation dialog instead of the
+   * `confirmed` argument. Opt-in, because some clients announce the capability and
+   * then dismiss the dialog without showing it.
+   */
+  approvalDialog: boolean;
   baseUrls: Record<ApiName, string>;
 }
 
@@ -58,6 +64,7 @@ export function loadLimits(env: NodeJS.ProcessEnv = process.env): Limits {
     maxOutputChars: intEnv(env, 'HETZNER_MAX_OUTPUT_CHARS', 40_000),
     maxRequestsPerRun: intEnv(env, 'HETZNER_MAX_REQUESTS_PER_RUN', 200),
     confirm: !/^(1|true|yes)$/i.test(env.HETZNER_SKIP_CONFIRMATION ?? ''),
+    approvalDialog: /^(1|true|yes)$/i.test(env.HETZNER_APPROVAL_DIALOG ?? ''),
     baseUrls: {
       cloud: (env.HETZNER_CLOUD_API_URL ?? 'https://api.hetzner.cloud/v1').replace(/\/+$/, ''),
       hetzner: (env.HETZNER_API_URL ?? 'https://api.hetzner.com/v1').replace(/\/+$/, ''),

@@ -94,6 +94,7 @@ minutes after three failed logins, so check the credentials before retrying.
 | `HETZNER_READ_ONLY` | off | `1` removes `hetzner_execute` and blocks every non-GET request |
 | `HETZNER_ALLOW_BILLED` | off | `1` allows requests that cost money (see [guard](#cost-and-damage-guard)) |
 | `HETZNER_SKIP_CONFIRMATION` | off | `1` sends billed and destructive requests without asking first |
+| `HETZNER_APPROVAL_DIALOG` | off | `1` asks for approval in a client dialog instead of `confirmed: true` |
 | `HETZNER_EXECUTE_TIMEOUT_SECONDS` | 120 | Maximum runtime of one code run |
 | `HETZNER_REQUEST_TIMEOUT_SECONDS` | 30 | Timeout of a single API call |
 | `HETZNER_MAX_REQUESTS_PER_RUN` | 200 | API calls allowed per code run |
@@ -149,10 +150,10 @@ changing a server, load balancer or Storage Box type, enlarging a volume, enabli
 and ordering through Robot. They are **refused** unless `HETZNER_ALLOW_BILLED=1` is set
 (hosted mode: `"billed": true` on the tenant).
 
-**Destructive requests** delete data or replace a whole configuration: every `DELETE`,
-rebuilding a server, disabling backups, rolling back a Storage Box snapshot, importing a
-zone file, replacing a firewall rule set, and in Robot cancellations, OS installations and
-the server firewall.
+**Destructive requests** delete something or destroy data: every `DELETE`, rebuilding a
+server, disabling backups, rolling back a Storage Box snapshot, importing a zone file, and
+in Robot cancellations and OS installations. Configuration changes that cost nothing and
+lose no data, such as firewall rules or DNS records, are not held back.
 
 Both kinds are not sent on the first attempt. The server works out what the request does
 and, for billed Cloud requests, the price from Hetzner's price list:
@@ -163,16 +164,18 @@ server, billed per hour until it is deleted (also while powered off). Price: ser
 cx23 in nbg1: 4.15 EUR/month, 0.0071 EUR/hour (incl. 19% VAT).
 ```
 
-How the approval happens depends on the client:
+There are two ways to approve:
 
-- Clients that support MCP elicitation show this text in a dialog and the person decides
-  (approve, approve everything else in this run, or decline). The model cannot answer it.
-- Otherwise the text goes back to the model, which has to tell the user and repeat the call
-  with `confirmed: true`. That argument is visible in the client's own approval prompt for
-  the tool call.
-
-The second path relies on the model reporting honestly and on you reading the approval
-prompt; it is a speed bump, not a lock. The billing switch is the hard limit: with it off,
+- **Default:** the text goes back to the model, which has to tell the user and repeat the
+  call with `confirmed: true`. That argument is visible in the client's own approval prompt
+  for the tool call. This relies on the model reporting honestly and on you reading the
+  prompt; it is a speed bump, not a lock.
+- **`HETZNER_APPROVAL_DIALOG=1`:** the server asks through an MCP elicitation dialog and
+  the person decides (approve, approve everything else in this run, or decline). The model
+  cannot answer it. Switch this on only if your client really shows such dialogs: some
+  announce the capability and then dismiss the dialog unseen, which would decline every
+  guarded request.
+ The billing switch is the hard limit: with it off,
 no code can create a billable resource. Prices for Robot orders and Storage Boxes are not
 looked up. `HETZNER_SKIP_CONFIRMATION=1` turns the approval step off for automation.
 

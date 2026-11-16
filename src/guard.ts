@@ -4,8 +4,9 @@
  *  - billed:      creates something Hetzner charges for, or raises a price. Off unless
  *                 the operator allows it; when allowed, it needs an approval that shows
  *                 the price.
- *  - destructive: deletes data or replaces a whole configuration. Needs an approval
- *                 that names what is affected.
+ *  - destructive: deletes something or destroys data. Needs an approval that names
+ *                 what is affected. Configuration changes that cost nothing and lose
+ *                 no data (firewall rules, DNS records, labels) are not guarded.
  *
  * Classification is by operation, not by guessing from the path, so the lists below
  * are the whole policy.
@@ -40,7 +41,6 @@ const DESTRUCTIVE_CLOUD: Record<string, string> = {
   disable_server_backup: 'disables backups and deletes all existing backups of the server',
   rollback_storage_box_snapshot: 'rolls the Storage Box back to a snapshot; newer data is lost',
   import_zone_zonefile: 'replaces all records of the DNS zone with the zone file',
-  set_firewall_rules: 'replaces the whole rule set of the firewall; rules not sent are removed',
 };
 
 const BILLED_ROBOT: Record<string, string> = {
@@ -56,7 +56,6 @@ const DESTRUCTIVE_ROBOT: Record<string, string> = {
   '/boot/{server-number}/linux': 'activates an OS installation; the next reboot wipes the disks',
   '/boot/{server-number}/vnc': 'activates an OS installation; the next reboot wipes the disks',
   '/boot/{server-number}/windows': 'activates an OS installation; the next reboot wipes the disks',
-  '/firewall/{server-id}': 'replaces the whole firewall configuration of the server; a wrong rule set can lock everyone out',
 };
 
 export function classify(api: ApiName, method: string, operation: { operationId: string; path: string } | undefined): GuardHit | undefined {
