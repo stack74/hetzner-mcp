@@ -148,5 +148,8 @@ await loadRobot();
 
 const out = fileURLToPath(new URL('../spec/operations.json', import.meta.url));
 mkdirSync(fileURLToPath(new URL('../spec/', import.meta.url)), { recursive: true });
-writeFileSync(out, JSON.stringify({ generatedAt: new Date().toISOString(), apis, operations }));
+// Hetzner's documentation uses a realistic-looking sample token. It is not a real
+// credential, but secret scanners flag it, so it is replaced with a placeholder.
+const SAMPLE_TOKEN = /\bL?RK9DAWQ1ZAEF[A-Za-z0-9]{20,}/g;
+writeFileSync(out, JSON.stringify({ generatedAt: new Date().toISOString(), apis, operations }).replace(SAMPLE_TOKEN, 'YOUR_API_TOKEN'));
 console.log(`Wrote ${operations.length} operations to ${out}`);
