@@ -1,6 +1,6 @@
 const TOKEN_PREFIX = 'HETZNER_API_TOKEN';
 
-export const SERVER_NAME = 'hetzner-mcp';
+export const SERVER_NAME = 'hetzner-code-mcp';
 export const SERVER_VERSION = '0.1.0';
 
 export type ApiName = 'cloud' | 'hetzner' | 'robot';
