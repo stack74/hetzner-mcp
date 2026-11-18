@@ -1,6 +1,6 @@
 {
   "name": "hetzner-code-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MCP server for the Hetzner Cloud and Robot APIs in code mode: search the API reference, then run JavaScript against the API. Local (stdio) or hosted (Streamable HTTP + OAuth).",
   "type": "module",
   "main": "dist/index.js",
