@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { after, before, test } from 'node:test';
+import { after, before, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const ENTRY = fileURLToPath(new URL('../dist/index.js', import.meta.url));
@@ -31,10 +31,62 @@ const freePort = () =>
   });
 
 const fake = { tokens: new Set(['token-prod-1111', 'token-stage-2222']), calls: [] };
-let fakeServer, server, base, dir, serverLog = '';
+let fakeServer, fakePort, server, base, dir;
+
+/** Starts `--http` with the test tenants; `env` overrides, `options.dir` reuses a data directory (same DB file). */
+async function startHosted(env = {}, options = {}) {
+  const port = options.port ?? (await freePort());
+  const dataDir = options.dir ?? mkdtempSync(path.join(tmpdir(), 'hetzner-mcp-test-'));
+  const url = `http://localhost:${port}`;
+  const child = spawn(process.execPath, [ENTRY, '--http'], {
+    env: {
+      PATH: process.env.PATH,
+      PORT: String(port),
+      HOST: '127.0.0.1',
+      HETZNER_MCP_PUBLIC_URL: url,
+      HETZNER_MCP_SECRET: 'test-secret-test-secret-test-secret-1234',
+      HETZNER_MCP_TENANTS: JSON.stringify({ tenants: TENANTS }),
+      HETZNER_MCP_DB_PATH: path.join(dataDir, 'db.sqlite'),
+      HETZNER_CLOUD_API_URL: `http://127.0.0.1:${fakePort}/v1`,
+      HETZNER_API_URL: `http://127.0.0.1:${fakePort}/v1`,
+      HETZNER_ROBOT_API_URL: `http://127.0.0.1:${fakePort}/robot`,
+      ...env,
+    },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let log = '';
+  child.stderr.on('data', (c) => (log += c));
+  const exited = new Promise((r) => child.once('exit', r));
+  const instance = {
+    base: url,
+    dir: dataDir,
+    port,
+    child,
+    get log() {
+      return log;
+    },
+    /** Stops the server; removes the data directory unless keepData. */
+    async stop({ keepData = false } = {}) {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      await exited;
+      if (!keepData) rmSync(dataDir, { recursive: true, force: true });
+    },
+  };
+  for (let i = 0; i < 100; i++) {
+    if (child.exitCode !== null) break;
+    try {
+      if ((await fetch(`${url}/healthz`)).ok) return instance;
+    } catch {
+      /* not up yet */
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  await instance.stop();
+  throw new Error(`server did not start: ${log}`);
+}
 
 before(async () => {
-  const fakePort = await freePort();
+  fakePort = await freePort();
   fakeServer = http.createServer((req, res) => {
     let body = '';
     req.on('data', (c) => (body += c));
@@ -61,52 +113,50 @@ before(async () => {
   });
   await new Promise((r) => fakeServer.listen(fakePort, '127.0.0.1', r));
 
-  const port = await freePort();
-  base = `http://localhost:${port}`;
-  dir = mkdtempSync(path.join(tmpdir(), 'hetzner-mcp-test-'));
-  server = spawn(process.execPath, [ENTRY, '--http'], {
-    env: {
-      PATH: process.env.PATH,
-      PORT: String(port),
-      HOST: '127.0.0.1',
-      HETZNER_MCP_PUBLIC_URL: base,
-      HETZNER_MCP_SECRET: 'test-secret-test-secret-test-secret-1234',
-      HETZNER_MCP_TENANTS: JSON.stringify({ tenants: TENANTS }),
-      HETZNER_MCP_DB_PATH: path.join(dir, 'db.sqlite'),
-      HETZNER_CLOUD_API_URL: `http://127.0.0.1:${fakePort}/v1`,
-      HETZNER_API_URL: `http://127.0.0.1:${fakePort}/v1`,
-      HETZNER_ROBOT_API_URL: `http://127.0.0.1:${fakePort}/robot`,
-    },
-    stdio: ['ignore', 'ignore', 'pipe'],
-  });
-  server.stderr.on('data', (c) => (serverLog += c));
-  for (let i = 0; i < 100; i++) {
-    try {
-      if ((await fetch(`${base}/healthz`)).ok) return;
-    } catch {
-      /* not up yet */
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error(`server did not start: ${serverLog}`);
+  server = await startHosted();
+  base = server.base;
+  dir = server.dir;
 });
 
-after(() => {
-  server?.kill();
+after(async () => {
+  await server?.stop();
   fakeServer?.close();
-  if (dir) rmSync(dir, { recursive: true, force: true });
 });
 
-const form = (data) => ({ method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(data) });
+const form = (data, cookie) => ({
+  method: 'POST',
+  redirect: 'manual',
+  headers: { 'content-type': 'application/x-www-form-urlencoded', ...(cookie ? { cookie } : {}) },
+  body: new URLSearchParams(data),
+});
+
+/** What a browser holds after opening a connect page: the CSRF cookie and the token in the forms. */
+async function csrfFor(page) {
+  const res = await fetch(page);
+  const html = await res.text();
+  const cookie = /hetzner_mcp_csrf=[^;]+/.exec(res.headers.get('set-cookie') ?? '')?.[0];
+  const csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1];
+  assert.ok(cookie && csrf, 'connect page must set a CSRF cookie and carry the token in its forms');
+  return { cookie, csrf, html, res };
+}
+
+/** Posts a form of the connect page `page` (e.g. '/finish', '/tenants/prod/key') the way a browser does. */
+async function submit(page, action, data = {}) {
+  const { cookie, csrf } = await csrfFor(page);
+  return fetch(`${page}${action}`, form({ ...data, csrf }, cookie));
+}
+
+const registerRaw = (at, redirectUri, clientName = 'test client') =>
+  fetch(`${at}/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: [redirectUri], client_name: clientName, token_endpoint_auth_method: 'none' }),
+  });
 
 /** Runs the MCP client's OAuth flow up to the connect page. */
 async function startAuthorization() {
   const redirectUri = 'http://localhost:9/callback';
-  const reg = await fetch(`${base}/register`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ redirect_uris: [redirectUri], client_name: 'test client', token_endpoint_auth_method: 'none' }),
-  });
+  const reg = await registerRaw(base, redirectUri);
   assert.equal(reg.status, 201, await reg.clone().text());
   const client = await reg.json();
   const verifier = randomBytes(32).toString('base64url');
@@ -122,7 +172,7 @@ async function startAuthorization() {
 }
 
 async function finishAuthorization({ client, verifier, redirectUri, page }) {
-  const finish = await fetch(`${page}/finish`, form({}));
+  const finish = await submit(page, '/finish');
   assert.equal(finish.status, 303);
   const target = new URL(finish.headers.get('location'));
   assert.equal(target.origin + target.pathname, redirectUri);
@@ -161,21 +211,21 @@ test('connect page: rejects bad credentials, stores good ones, then issues token
   for (const t of TENANTS) assert.ok(html.includes(t.name), t.name);
   assert.match(html, /Nur lesen/);
 
-  const early = await fetch(`${flow.page}/finish`, form({}));
+  const early = await submit(flow.page, '/finish');
   assert.match(early.headers.get('location'), /e=none_connected/);
 
-  const bad = await fetch(`${flow.page}/tenants/prod/key`, form({ api_token: 'wrong-token' }));
+  const bad = await submit(flow.page, '/tenants/prod/key', { api_token: 'wrong-token' });
   assert.equal(bad.status, 400);
   assert.match(await bad.text(), /nicht akzeptiert/);
 
-  const good = await fetch(`${flow.page}/tenants/prod/key`, form({ api_token: 'token-prod-1111' }));
+  const good = await submit(flow.page, '/tenants/prod/key', { api_token: 'token-prod-1111' });
   assert.equal(good.status, 303);
   assert.match(good.headers.get('location'), /n=connected&t=prod/);
-  assert.equal((await fetch(`${flow.page}/tenants/stage/key`, form({ api_token: 'token-stage-2222' }))).status, 303);
+  assert.equal((await submit(flow.page, '/tenants/stage/key', { api_token: 'token-stage-2222' })).status, 303);
 
-  const badRobot = await fetch(`${flow.page}/tenants/metal/key`, form({ robot_user: '#ws+abc', robot_password: 'nope' }));
+  const badRobot = await submit(flow.page, '/tenants/metal/key', { robot_user: '#ws+abc', robot_password: 'nope' });
   assert.equal(badRobot.status, 400);
-  assert.equal((await fetch(`${flow.page}/tenants/metal/key`, form({ robot_user: '#ws+abc', robot_password: 'robot-secret' }))).status, 303);
+  assert.equal((await submit(flow.page, '/tenants/metal/key', { robot_user: '#ws+abc', robot_password: 'robot-secret' })).status, 303);
 
   const after = await (await fetch(flow.page)).text();
   assert.match(after, /Token …1111/);
@@ -239,7 +289,7 @@ test('rejected credentials are marked and the model gets a link to replace them'
   const link = accounts.structured.connect_url;
   assert.match(await (await fetch(link)).text(), /abgelehnt/);
   fake.tokens.add('token-stage-3333');
-  assert.equal((await fetch(`${link}/tenants/stage/key`, form({ api_token: 'token-stage-3333' }))).status, 303);
+  assert.equal((await submit(link, '/tenants/stage/key', { api_token: 'token-stage-3333' })).status, 303);
   const repaired = await call(tokens.access_token, 'hetzner_query', { code: "async () => (await hetzner.get('/servers')).servers[0].name", project: 'stage' });
   assert.equal(JSON.parse(repaired.text), 'server-of-token-stage-3333');
 });
@@ -247,7 +297,7 @@ test('rejected credentials are marked and the model gets a link to replace them'
 test('refresh tokens rotate and a second person sees only their own connections', async () => {
   const flow = await startAuthorization();
   assert.doesNotMatch(await (await fetch(flow.page)).text(), /Token …1111/);
-  assert.equal((await fetch(`${flow.page}/tenants/prod/key`, form({ api_token: 'token-prod-1111' }))).status, 303);
+  assert.equal((await submit(flow.page, '/tenants/prod/key', { api_token: 'token-prod-1111' })).status, 303);
   const other = await finishAuthorization(flow);
   const robot = await call(other.access_token, 'hetzner_query', { code: "async () => robot.get('/server')" });
   assert.equal(robot.isError, true);
@@ -259,4 +309,115 @@ test('refresh tokens rotate and a second person sees only their own connections'
   assert.equal(refreshed.status, 200);
   const reuse = await fetch(`${base}/token`, form({ grant_type: 'refresh_token', refresh_token: other.refresh_token, client_id: flow.client.client_id }));
   assert.equal(reuse.status, 400);
+});
+
+describe('hosted mode: who may receive the access (confused deputy)', () => {
+  const authorizeUrl = (at, clientId, redirectUri, challenge = 'x'.repeat(43)) =>
+    `${at}/authorize?${new URLSearchParams({ response_type: 'code', client_id: clientId, redirect_uri: redirectUri, code_challenge: challenge, code_challenge_method: 'S256', state: 'xyz' })}`;
+
+  test('only known redirect URIs may register; the list can be extended or replaced via env', async () => {
+    const extended = await startHosted({ HETZNER_MCP_ALLOWED_REDIRECT_URIS: 'https://app.example.com/oauth/callback' });
+    try {
+      const evil = await registerRaw(extended.base, 'https://attacker.example/steal');
+      assert.equal(evil.status, 400);
+      assert.equal((await evil.json()).error, 'invalid_redirect_uri');
+      // Look-alikes of allowed hosts do not pass.
+      for (const uri of [
+        'https://claude.ai.attacker.example/api/mcp/auth_callback',
+        'http://localhost.attacker.example/cb',
+        'https://claude.ai/other',
+        'http://user@localhost:9/cb',
+      ]) {
+        assert.equal((await registerRaw(extended.base, uri)).status, 400, uri);
+      }
+      for (const uri of [
+        'https://claude.ai/api/mcp/auth_callback',
+        'https://claude.com/api/mcp/auth_callback',
+        'http://localhost:53682/callback',
+        'http://127.0.0.1:8080/',
+        'https://app.example.com/oauth/callback',
+      ]) {
+        assert.equal((await registerRaw(extended.base, uri)).status, 201, uri);
+      }
+      assert.match(extended.log, /Client registration refused: redirect URI\(s\) not allowed: https:\/\/attacker\.example\/steal/);
+    } finally {
+      await extended.stop();
+    }
+
+    const strict = await startHosted({ HETZNER_MCP_DEFAULT_REDIRECT_URIS: 'false', HETZNER_MCP_ALLOWED_REDIRECT_URIS: 'https://claude.ai/api/mcp/auth_callback' });
+    try {
+      assert.equal((await registerRaw(strict.base, 'http://localhost:53682/callback')).status, 400);
+      assert.equal((await registerRaw(strict.base, 'https://claude.ai/api/mcp/auth_callback')).status, 201);
+    } finally {
+      await strict.stop();
+    }
+
+    // Defaults dropped and nothing listed: the server refuses to start.
+    await assert.rejects(startHosted({ HETZNER_MCP_DEFAULT_REDIRECT_URIS: 'false' }), /no redirect URIs allowed/);
+  });
+
+  test('/authorize is refused without redirect for a client registered before the list was narrowed', async () => {
+    const loose = await startHosted({ HETZNER_MCP_ALLOWED_REDIRECT_URIS: 'https://old.example/cb' });
+    const reg = await registerRaw(loose.base, 'https://old.example/cb');
+    assert.equal(reg.status, 201);
+    const { client_id: clientId } = await reg.json();
+    await loose.stop({ keepData: true });
+
+    const narrowed = await startHosted({}, { dir: loose.dir });
+    try {
+      const res = await fetch(authorizeUrl(narrowed.base, clientId, 'https://old.example/cb'), { redirect: 'manual' });
+      assert.equal(res.status, 400);
+      assert.equal(res.headers.get('location'), null);
+      assert.match(await res.text(), /Verbindung abgelehnt/);
+    } finally {
+      await narrowed.stop();
+    }
+  });
+
+  test('the connect page names the app and where the access goes', async () => {
+    const flow = await startAuthorization();
+    const { html, res } = await csrfFor(flow.page);
+    assert.match(html, /„test client“/);
+    assert.match(html, /nicht geprüft/);
+    assert.match(html, /deinem eigenen Computer<\/b> \(localhost:9\)/);
+    assert.match(html, /Abbrechen/);
+    assert.match(res.headers.get('set-cookie') ?? '', /HttpOnly/i);
+    assert.match(res.headers.get('set-cookie') ?? '', /SameSite=Strict/i);
+    assert.match(res.headers.get('set-cookie') ?? '', new RegExp(`Path=${new URL(flow.page).pathname}`));
+
+    // A remote redirect target is shown by host, so a person can check it.
+    const reg = await registerRaw(base, 'https://claude.ai/api/mcp/auth_callback', 'Claude');
+    const { client_id: clientId } = await reg.json();
+    const authorize = await fetch(authorizeUrl(base, clientId, 'https://claude.ai/api/mcp/auth_callback'), { redirect: 'manual' });
+    assert.equal(authorize.status, 302);
+    const remote = await (await fetch(`${base}${authorize.headers.get('location')}`)).text();
+    assert.match(remote, /„Claude“/);
+    assert.match(remote, /<b>claude\.ai<\/b>/);
+  });
+
+  test('the connect page forms cannot be posted cross-site (CSRF)', async () => {
+    const flow = await startAuthorization();
+    const { cookie, csrf } = await csrfFor(flow.page);
+
+    // A cross-site post may know the token from the page at best, never carries the Strict cookie.
+    const noCookie = await fetch(`${flow.page}/tenants/prod/key`, form({ api_token: 'token-prod-1111', csrf }));
+    assert.equal(noCookie.status, 403);
+    assert.match(await noCookie.text(), /Nicht bestätigt/);
+    assert.doesNotMatch(await (await fetch(flow.page)).text(), /Token …1111/, 'nothing stored');
+
+    for (const action of ['/finish', '/cancel', '/tenants/prod/disconnect']) {
+      assert.equal((await fetch(`${flow.page}${action}`, form({}))).status, 403, `${action} without cookie and token`);
+      assert.equal((await fetch(`${flow.page}${action}`, form({ csrf }))).status, 403, `${action} without cookie`);
+      assert.equal((await fetch(`${flow.page}${action}`, form({}, cookie))).status, 403, `${action} without token`);
+    }
+    // A token from another session does not fit this one.
+    const other = await startAuthorization();
+    const foreign = await csrfFor(other.page);
+    assert.equal((await fetch(`${flow.page}/finish`, form({ csrf: foreign.csrf }, foreign.cookie))).status, 403);
+
+    // The session is untouched and works with the real cookie and token.
+    assert.equal((await submit(flow.page, '/tenants/prod/key', { api_token: 'token-prod-1111' })).status, 303);
+    const done = await finishAuthorization(flow);
+    assert.ok(done.access_token);
+  });
 });

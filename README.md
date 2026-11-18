@@ -231,6 +231,8 @@ a token stored under "Production" really is from that project.
 | `HETZNER_MCP_DB_PATH` | `./data/hetzner-mcp.sqlite` | SQLite file. Put it on a persistent volume. |
 | `PORT` / `HOST` | `3000` / `0.0.0.0` | Listen address. |
 | `HETZNER_MCP_CF_ACCESS_TEAM_DOMAIN` / `HETZNER_MCP_CF_ACCESS_AUD` | — | Put the connect pages behind Cloudflare Access: team domain and the Access application's AUD tag. `/connect/*` then requires a valid Access token, checked by the server itself. |
+| `HETZNER_MCP_ALLOWED_REDIRECT_URIS` | — | Comma-separated redirect URIs MCP clients may register, **in addition to** the built-in ones (`https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback`, `http://localhost:*`, `http://127.0.0.1:*`, `http://[::1]:*`). `:*` matches any port; a pattern without a path matches any path on that origin. See [Security](#security-of-the-connect-flow). |
+| `HETZNER_MCP_DEFAULT_REDIRECT_URIS` | `true` | `false` drops the built-in redirect URIs, so only `HETZNER_MCP_ALLOWED_REDIRECT_URIS` applies (the server refuses to start if that leaves none). |
 | `HETZNER_MCP_ICON_PATH` | — | Path to an `.svg`, `.png` or `.ico` file, served as favicon and announced as the MCP server icon. |
 | `HETZNER_MCP_ACCESS_TOKEN_TTL` | `3600` | Lifetime (s) of access tokens issued to MCP clients. |
 | `HETZNER_MCP_REFRESH_TOKEN_TTL` | `7776000` | Lifetime (s) of refresh tokens issued to MCP clients (90 days). |
@@ -257,6 +259,28 @@ flow and store their own credentials; they never see anyone else's. To keep stra
 altogether, put the path `/connect` behind Cloudflare Access (or a comparable login) and
 set the two `HETZNER_MCP_CF_ACCESS_*` variables. Leave `/mcp`, `/token`, `/register`,
 `/authorize` and `/.well-known/*` outside: claude.ai calls them from its servers.
+
+### Security of the connect flow
+
+Whoever finishes the connect page hands the MCP client access to the Hetzner projects they
+just connected. That invites the "confused deputy" attack from the MCP security best
+practices: someone registers their own client with their own redirect URI, starts
+`/authorize`, and sends a colleague the resulting `/connect/…` link. The colleague stores
+their API tokens, presses *Fertig*, and the authorization code would go to the attacker.
+Two independent checks prevent that:
+
+- **Redirect allowlist.** Dynamic client registration only accepts known redirect URIs
+  (claude.ai, claude.com and loopback by default, extendable with
+  `HETZNER_MCP_ALLOWED_REDIRECT_URIS`); `/authorize` checks again and answers with an error
+  page instead of a redirect, so narrowing the list also locks out clients registered
+  earlier. Loopback addresses are allowed because a code sent there can only reach the
+  person's own machine.
+- **The connect page says who asks.** On top of the page it shows the app's name (declared
+  by the app itself, so marked as unverified) and, more importantly, the address the access
+  goes to, with the advice to cancel if the person did not start the connection in Claude
+  themselves. Every form on the page (store credentials, *Trennen*, *Fertig*, *Abbrechen*)
+  carries a CSRF token that must match an `HttpOnly`, `SameSite=Strict` cookie scoped to the
+  session, so another site that knows the link cannot submit them on the person's behalf.
 
 ## Security
 

@@ -38,6 +38,9 @@ input { width:100%; font:inherit; padding:8px 10px; border:1px solid var(--line)
 .banner.error { border-color:var(--danger); color:var(--danger); }
 .banner.notice { border-color:var(--ok); color:var(--ok); }
 details { margin-top:24px; color:var(--muted); font-size:13px; }
+.request { padding:14px 16px; margin-bottom:20px; border-color:var(--warn); }
+.request p { margin:0 0 8px; } .request p:last-child { margin-bottom:0; }
+.muted { color:var(--muted); font-size:13px; }
 `;
 
 let iconLink = "";
@@ -56,15 +59,31 @@ function layout(title: string, body: string): string {
 const formatDate = (seconds: number): string =>
   new Date(seconds * 1000).toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "numeric", timeZone: "Europe/Berlin" });
 
+/** Hidden CSRF field for every POST form on the connect pages (checked against a SameSite=Strict cookie). */
+const csrfField = (token: string): string => `<input type="hidden" name="csrf" value="${escape(token)}">`;
+
+/** Where the access goes once the person presses "Fertig", in words they can check. */
+export function describeTarget(redirectUri: string): string {
+  try {
+    const url = new URL(redirectUri);
+    if (["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+      return `eine App auf <b>deinem eigenen Computer</b> (${escape(url.host)}), z. B. Claude Code oder Claude Desktop`;
+    }
+    return `<b>${escape(url.host)}</b> <span class="muted">${escape(url.pathname)}</span>`;
+  } catch {
+    return escape(redirectUri);
+  }
+}
+
 const kindLabel = (tenant: TenantConfig): string => (tenant.type === "robot" ? "Robot" : "Cloud-Projekt");
 
-function tenantRow(sessionId: string, tenant: TenantConfig, connection: ConnectionRow | undefined): string {
+function tenantRow(sessionId: string, csrfToken: string, tenant: TenantConfig, connection: ConnectionRow | undefined): string {
   const base = `/connect/${encodeURIComponent(sessionId)}/tenants/${encodeURIComponent(tenant.id)}`;
   const badges =
     `<span class="badge">${kindLabel(tenant)}</span>` + `<span class="badge">${tenant.writes ? (tenant.billed ? "Lesen, Schreiben &amp; Kostenpflichtiges" : "Lesen &amp; Schreiben") : "Nur lesen"}</span>`;
   const connectButton = (label: string, primary: boolean): string =>
     `<form method="get" action="${base}/key"><button${primary ? ' class="primary"' : ""}>${label}</button></form>`;
-  const disconnect = `<form method="post" action="${base}/disconnect"><button class="link">Trennen</button></form>`;
+  const disconnect = `<form method="post" action="${base}/disconnect">${csrfField(csrfToken)}<button class="link">Trennen</button></form>`;
   let status: string;
   let actions: string;
   if (!connection) {
@@ -84,13 +103,17 @@ export interface ConnectPageInput {
   /** Who is looking, when Cloudflare Access is in front (their e-mail). */
   viewer?: string;
   session: SessionRow;
+  /** CSRF token for the POST forms; the same value is set as cookie. */
+  csrfToken: string;
+  /** For "authorize" sessions: the client_name the MCP client registered with (self-declared). */
+  clientName?: string;
   tenants: TenantConfig[];
   connections: ConnectionRow[];
   error?: string;
   notice?: string;
 }
 
-export function renderConnectPage({ viewer, session, tenants, connections, error, notice }: ConnectPageInput): string {
+export function renderConnectPage({ viewer, session, csrfToken, clientName, tenants, connections, error, notice }: ConnectPageInput): string {
   const byTenant = new Map(connections.map((c) => [c.tenant_id, c]));
   const usable = connections.filter((c) => !c.broken_reason && tenants.some((t) => t.id === c.tenant_id)).length;
   const sid = encodeURIComponent(session.id);
@@ -102,10 +125,22 @@ export function renderConnectPage({ viewer, session, tenants, connections, error
     session.kind === "authorize"
       ? `<div class="footer">
           <span class="hint">${usable === 0 ? "Verbinde mindestens einen Eintrag." : `${usable} verbunden.`}</span>
-          <form method="post" action="/connect/${sid}/cancel"><button>Abbrechen</button></form>
-          <form method="post" action="/connect/${sid}/finish"><button class="primary"${usable === 0 ? " disabled" : ""}>Fertig – zurück zu Claude</button></form>
+          <form method="post" action="/connect/${sid}/cancel">${csrfField(csrfToken)}<button>Abbrechen</button></form>
+          <form method="post" action="/connect/${sid}/finish">${csrfField(csrfToken)}<button class="primary"${usable === 0 ? " disabled" : ""}>Fertig – zurück zu Claude</button></form>
         </div>`
-      : `<div class="footer"><form method="post" action="/connect/${sid}/finish"><button class="primary">Fertig</button></form></div>`;
+      : `<div class="footer"><form method="post" action="/connect/${sid}/finish">${csrfField(csrfToken)}<button class="primary">Fertig</button></form></div>`;
+
+  // Who asks and where the access goes: the person must be able to tell a connection they
+  // started themselves from a link someone else sent them (confused deputy).
+  const name = clientName?.trim() ? `„${escape(clientName.trim().slice(0, 100))}“` : "Eine App ohne Namen";
+  const request =
+    session.kind === "authorize" && session.redirect_uri
+      ? `<div class="card request">
+          <p><b>${name}</b> <span class="muted">(Name von der App selbst angegeben, nicht geprüft)</span> möchte Zugriff auf die Projekte und Robot-Accounts, die du hier verbindest.</p>
+          <p>Mit „Fertig“ geht der Zugriff an:<br>${describeTarget(session.redirect_uri)}</p>
+          <p class="muted">Entscheidend ist die Adresse, nicht der Name. Hast du diese Verbindung nicht gerade selbst in Claude gestartet, sondern den Link von jemand anderem bekommen: trage nichts ein und klicke auf „Abbrechen“.</p>
+        </div>`
+      : "";
 
   return layout(
     "Hetzner verbinden",
@@ -113,8 +148,9 @@ export function renderConnectPage({ viewer, session, tenants, connections, error
     <p class="lead">Verbinde jedes Projekt und jeden Robot-Account, auf den du Zugriff hast, mit einem API-Token bzw. Webservice-Benutzer.
     Was du nicht brauchst, lässt du einfach aus – du kannst es später ergänzen.</p>
     ${viewer ? `<p class="status" style="margin:-16px 0 20px">Angemeldet als ${escape(viewer)}</p>` : ""}
+    ${request}
     ${banners}
-    <div class="card">${tenants.map((t) => tenantRow(session.id, t, byTenant.get(t.id))).join("")}</div>
+    <div class="card">${tenants.map((t) => tenantRow(session.id, csrfToken, t, byTenant.get(t.id))).join("")}</div>
     ${footer}
     <details><summary>Hinweise</summary>
       <p>Die Zugangsdaten werden verschlüsselt gespeichert und nur für deine eigenen Anfragen über Claude verwendet.</p>
@@ -124,7 +160,7 @@ export function renderConnectPage({ viewer, session, tenants, connections, error
   );
 }
 
-export function renderKeyForm(session: SessionRow, tenant: TenantConfig, error?: string): string {
+export function renderKeyForm(session: SessionRow, tenant: TenantConfig, csrfToken: string, error?: string): string {
   const sid = encodeURIComponent(session.id);
   const action = `/connect/${sid}/tenants/${encodeURIComponent(tenant.id)}/key`;
   const fields =
@@ -156,6 +192,7 @@ export function renderKeyForm(session: SessionRow, tenant: TenantConfig, error?:
     ${error ? `<div class="banner error">${escape(error)}</div>` : ""}
     <div class="card" style="padding:16px">
       <form method="post" action="${action}">
+        ${csrfField(csrfToken)}
         ${fields}
         <div class="footer">
           <span class="hint">${hint}</span>

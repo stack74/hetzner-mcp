@@ -13,7 +13,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Request, Response } from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
-import { InvalidGrantError, InvalidTargetError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import { CustomOAuthError, InvalidGrantError, InvalidTargetError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { AuthorizationParams, OAuthServerProvider } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type {
@@ -22,6 +22,7 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { HostedConfig } from "./config.js";
+import { renderMessage } from "./pages.js";
 import type { SessionRow, Store } from "./store.js";
 
 /** How long the connect page stays usable once opened. */
@@ -85,6 +86,18 @@ export class HostedOAuthProvider implements OAuthServerProvider {
     this.clientsStore = {
       getClient: (clientId) => store.getClient(clientId),
       registerClient: (client) => {
+        // Only known redirect targets: an attacker-controlled one would receive
+        // the code for whoever stores their tokens on the connect page (see redirects.ts).
+        const uris = (client.redirect_uris ?? []).map(String);
+        const refused = uris.filter((uri) => !config.redirects.allows(uri));
+        if (refused.length > 0 || uris.length === 0) {
+          console.error(`Client registration refused: redirect URI(s) not allowed: ${refused.join(", ") || "(none given)"}`);
+          throw new CustomOAuthError(
+            "invalid_redirect_uri",
+            `Redirect URI not allowed on this server: ${refused.join(", ") || "(none given)"}. ` +
+              "The operator can extend HETZNER_MCP_ALLOWED_REDIRECT_URIS.",
+          );
+        }
         const full = client as OAuthClientInformationFull;
         store.saveClient(full);
         return full;
@@ -102,6 +115,22 @@ export class HostedOAuthProvider implements OAuthServerProvider {
   }
 
   async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
+    // Checked again here: the client may have registered before the allowlist was narrowed.
+    // Answer with a page instead of redirecting — the redirect target is the problem.
+    if (!this.config.redirects.allows(params.redirectUri)) {
+      console.error(`Authorization refused for client ${client.client_id}: redirect URI ${params.redirectUri} not allowed`);
+      res.setHeader("Cache-Control", "no-store");
+      res
+        .status(400)
+        .type("html")
+        .send(
+          renderMessage(
+            "Verbindung abgelehnt",
+            "Diese App darf sich nicht mit diesem Server verbinden: ihre Rücksprungadresse ist nicht freigegeben.",
+          ),
+        );
+      return;
+    }
     this.checkResource(params.resource);
     const remembered = this.cookie.read(res.req);
     const grantId = remembered && this.store.grantExists(remembered) ? remembered : this.store.createGrant();

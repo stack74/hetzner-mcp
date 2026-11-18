@@ -8,6 +8,7 @@
 
 import { readFileSync } from "node:fs";
 import { loadLimits, type Limits } from "../config.js";
+import { DEFAULT_REDIRECT_PATTERNS, RedirectPolicy } from "./redirects.js";
 
 export interface TenantConfig {
   /** Slug the model passes as `project` (cloud) or `robot_account` (robot). */
@@ -37,6 +38,8 @@ export interface HostedConfig {
    * answers requests carrying a valid Access token for this application.
    */
   cloudflareAccess?: { issuer: string; audience: string };
+  /** Redirect URIs MCP clients may register (see redirects.ts). */
+  redirects: RedirectPolicy;
   /** Icon served as favicon and announced in the MCP server info. */
   icon?: { path: string; mimeType: string; extension: "svg" | "png" | "ico" };
   /** Lifetime of the access tokens this server issues to MCP clients. */
@@ -90,6 +93,12 @@ function intEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): number 
   if (Number.isNaN(value) || value < 1) fail(`${name} must be a positive integer`);
   return value;
 }
+
+const list = (raw: string | undefined): string[] =>
+  (raw ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
 export function loadHostedConfig(env: NodeJS.ProcessEnv = process.env): HostedConfig {
   const rawUrl = env.HETZNER_MCP_PUBLIC_URL?.trim();
@@ -153,6 +162,20 @@ export function loadHostedConfig(env: NodeJS.ProcessEnv = process.env): HostedCo
     icon = { path: iconPath, mimeType, extension };
   }
 
+  let redirects: RedirectPolicy;
+  // Extra entries extend the built-in list (claude.ai, claude.com, loopback);
+  // HETZNER_MCP_DEFAULT_REDIRECT_URIS=false drops the built-ins.
+  const withDefaults = !/^(0|false|no)$/i.test(env.HETZNER_MCP_DEFAULT_REDIRECT_URIS?.trim() ?? "");
+  const redirectSources = [...(withDefaults ? DEFAULT_REDIRECT_PATTERNS : []), ...list(env.HETZNER_MCP_ALLOWED_REDIRECT_URIS)];
+  if (redirectSources.length === 0) {
+    fail("no redirect URIs allowed: set HETZNER_MCP_ALLOWED_REDIRECT_URIS when HETZNER_MCP_DEFAULT_REDIRECT_URIS=false");
+  }
+  try {
+    redirects = new RedirectPolicy(redirectSources);
+  } catch (error) {
+    fail(`HETZNER_MCP_ALLOWED_REDIRECT_URIS: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
   return {
     publicUrl,
     mcpUrl: new URL(`${publicUrl.href.replace(/\/+$/, "")}/mcp`),
@@ -162,6 +185,7 @@ export function loadHostedConfig(env: NodeJS.ProcessEnv = process.env): HostedCo
     dbPath: env.HETZNER_MCP_DB_PATH?.trim() || "./data/hetzner-mcp.sqlite",
     tenants,
     ...(cloudflareAccess ? { cloudflareAccess } : {}),
+    redirects,
     ...(icon ? { icon } : {}),
     accessTokenTtlSeconds: intEnv(env, "HETZNER_MCP_ACCESS_TOKEN_TTL", 3600),
     refreshTokenTtlSeconds: intEnv(env, "HETZNER_MCP_REFRESH_TOKEN_TTL", 90 * 24 * 3600),
