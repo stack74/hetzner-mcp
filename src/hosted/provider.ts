@@ -33,7 +33,9 @@ const GRANT_COOKIE_MAX_AGE = 180 * 24 * 3600;
 
 /**
  * Remembers a person's grant in their browser, so reconnecting the MCP client
- * (new token, same person) finds the Hetzner accounts already connected.
+ * (new token, same person) finds the Hetzner accounts already connected. The
+ * connect pages also use it to refuse links that belong to a different grant
+ * than the one this browser is connected with (see http.ts).
  */
 export class GrantCookie {
   constructor(
@@ -51,7 +53,13 @@ export class GrantCookie {
     for (const part of header.split(";")) {
       const [name, ...rest] = part.trim().split("=");
       if (name !== GRANT_COOKIE) continue;
-      const [grantId, signature] = decodeURIComponent(rest.join("=")).split(".");
+      let value: string;
+      try {
+        value = decodeURIComponent(rest.join("="));
+      } catch {
+        return undefined;
+      }
+      const [grantId, signature] = value.split(".");
       if (!grantId || !signature) return undefined;
       const expected = Buffer.from(this.sign(grantId));
       const actual = Buffer.from(signature);

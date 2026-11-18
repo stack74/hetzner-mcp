@@ -24,7 +24,7 @@ import { accountInstructions, registerAccountTools } from "./accounts.js";
 import { type HostedConfig, loadHostedConfig, type TenantConfig } from "./config.js";
 import { renderConnectPage, renderKeyForm, renderMessage, setPageIcon } from "./pages.js";
 import { GrantCookie, HostedOAuthProvider, SESSION_TTL_SECONDS } from "./provider.js";
-import { type ConnectionSecret, type SessionRow, Store } from "./store.js";
+import { type ConnectionSecret, randomToken, type SessionRow, Store } from "./store.js";
 
 /** Banner texts on the connect page, addressed by code so a crafted link cannot inject text. */
 const MESSAGES: Record<string, (tenant?: TenantConfig) => string> = {
@@ -172,22 +172,84 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
       );
   };
 
-  const loadSession = (req: Request, res: Response): SessionRow | undefined => {
-    const session = store.getSession(String(req.params.sid));
-    if (!session) expired(res);
-    return session;
+  const refuse = (res: Response, title: string, text: string): void => {
+    pageHeaders(res);
+    res.status(403).type("html").send(renderMessage(title, text));
+  };
+
+  // --- who may use a connect-page session ------------------------------------
+  //
+  // A session id in a link is all it takes to open the page, and links get
+  // forwarded: a "manage" link from hetzner_list_accounts sent to a colleague
+  // would let them store their API tokens in the sender's grant. Before any page
+  // or form of a session is served:
+  //  - a browser that finished an authorization remembers its grant (GrantCookie);
+  //    a link for a different grant is refused there;
+  //  - behind Cloudflare Access a grant records its owner when the first
+  //    authorization finishes; after that only the owner may open its pages.
+  // Grants without owner and browsers without grant cookie fall back to the
+  // warning on manage pages (pages.ts).
+
+  const sessionOf = (res: Response): SessionRow => res.locals.session as SessionRow;
+
+  const guardSession = (req: Request, res: Response, next: NextFunction): void => {
+    const sid = String(req.params.sid);
+    const session = store.getSession(sid);
+    if (!session) return expired(res);
+    const what = `${req.method} ${req.path.replace(sid, ":sid")}`;
+
+    // Valid means signed by us and still existing: authorize() only reuses an existing
+    // grant, so for any other cookie the authorization flow runs with a new grant.
+    const remembered = cookie.read(req);
+    if (remembered && remembered !== session.grant_id && store.grantExists(remembered)) {
+      console.error(`Connect page: ${what} refused, this browser is connected with a different grant`);
+      return refuse(
+        res,
+        "Anderer Claude-Zugang",
+        "Dieser Link gehört zu einem anderen Claude-Zugang als dem, der in diesem Browser verbunden ist. " +
+          "Hat dir jemand diesen Link geschickt, schließ die Seite und hinterlege hier nichts. " +
+          "Brauchst du selbst einen Link, lass ihn dir von Claude in deinem eigenen Chat geben (hetzner_list_accounts).",
+      );
+    }
+
+    if (access) {
+      const owner = store.getGrantOwner(session.grant_id);
+      const viewer = viewerOf(res);
+      if (owner && viewer?.toLowerCase() !== owner.toLowerCase()) {
+        // The owner's address stays out of the page.
+        console.error(`Connect page: ${what} refused, ${viewer ?? "unknown viewer"} is not the owner of this grant`);
+        return refuse(
+          res,
+          "Kein Zugriff",
+          "Dieser Link gehört zum Claude-Zugang einer anderen Person und kann von dir nicht verwendet werden. " +
+            "Brauchst du selbst einen Link, lass ihn dir von Claude in deinem eigenen Chat geben (hetzner_list_accounts).",
+        );
+      }
+    }
+
+    res.locals.session = session;
+    next();
   };
 
   // --- CSRF protection for the connect page's forms -------------------------
   //
-  // Whoever started /authorize knows the session id, so a cross-site page could
-  // otherwise post the forms (store a key, disconnect, finish, cancel) on the
-  // person's behalf. Every POST carries a token derived from the session id that
-  // must also arrive as a SameSite=Strict cookie, which a cross-site post never sends.
+  // Whoever started /authorize knows the session id, so the session id alone
+  // cannot authenticate a form. Every POST carries a token bound to the session
+  // and to this browser: HMAC(secret, "csrf:<sid>:<browser nonce>"), where the
+  // nonce is a random value in an HttpOnly cookie. Someone who opens the page
+  // gets a token for their own nonce only; they cannot read the victim's nonce,
+  // cannot compute the HMAC without the secret, and – with https, where the
+  // cookie carries the __Host- prefix – cannot plant a nonce of their choosing
+  // from a sibling subdomain either.
 
-  const CSRF_COOKIE = "hetzner_mcp_csrf";
-  const csrfCookiePath = (sid: string): string => `/connect/${encodeURIComponent(sid)}`;
-  const csrfToken = (sid: string): string => createHmac("sha256", config.secret).update(`csrf:${sid}`).digest("base64url");
+  const secureCookies = config.publicUrl.protocol === "https:";
+  // __Host- requires Secure, Path=/ and no Domain; browsers reject it over plain http.
+  const BROWSER_COOKIE = secureCookies ? "__Host-hetzner_mcp_browser" : "hetzner_mcp_browser";
+  const BROWSER_NONCE = /^[A-Za-z0-9_-]{43}$/;
+  const BROWSER_COOKIE_MAX_AGE_MS = 24 * 3600 * 1000;
+
+  const csrfToken = (sid: string, nonce: string): string =>
+    createHmac("sha256", config.secret).update(`csrf:${sid}:${nonce}`).digest("base64url");
   const sameToken = (a: string, b: string): boolean => {
     const x = Buffer.from(a);
     const y = Buffer.from(b);
@@ -205,41 +267,39 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
     }
     return undefined;
   };
+  const readBrowserNonce = (req: Request): string | undefined => {
+    const value = readCookie(req, BROWSER_COOKIE);
+    return value && BROWSER_NONCE.test(value) ? value : undefined;
+  };
 
-  /** Sets the CSRF cookie for a page of this session and returns the token for its forms. */
-  const issueCsrf = (res: Response, session: SessionRow): string => {
-    const token = csrfToken(session.id);
-    res.cookie(CSRF_COOKIE, token, {
+  /** Makes sure the browser has a nonce cookie (keeping a well-formed one) and returns the token for this session's forms. */
+  const issueCsrf = (req: Request, res: Response, session: SessionRow): string => {
+    const nonce = readBrowserNonce(req) ?? randomToken(32);
+    // Set again on every page, so it cannot expire while a page is open.
+    res.cookie(BROWSER_COOKIE, nonce, {
       httpOnly: true,
-      secure: config.publicUrl.protocol === "https:",
-      sameSite: "strict",
-      path: csrfCookiePath(session.id),
-      maxAge: SESSION_TTL_SECONDS * 1000,
+      secure: secureCookies,
+      sameSite: "lax",
+      path: "/",
+      maxAge: BROWSER_COOKIE_MAX_AGE_MS,
     });
-    return token;
+    return csrfToken(session.id, nonce);
   };
 
   const formBody = express.urlencoded({ extended: false, limit: "4kb" });
 
-  /** For every POST under /connect/:sid/…: cookie, form field and expected token must match. */
+  /** For every POST under /connect/:sid/… (after guardSession): the form token must fit this session and this browser. */
   const requireCsrf = (req: Request, res: Response, next: NextFunction): void => {
-    const sid = String(req.params.sid);
-    if (!store.getSession(sid)) return expired(res);
-    const expected = csrfToken(sid);
+    const session = sessionOf(res);
+    const nonce = readBrowserNonce(req);
     const field = typeof req.body?.csrf === "string" ? (req.body.csrf as string) : "";
-    const fromCookie = readCookie(req, CSRF_COOKIE) ?? "";
-    if (sameToken(field, expected) && sameToken(fromCookie, expected)) return next();
-    console.error(`Connect page: ${req.method} ${req.path.replace(sid, ":sid")} refused, CSRF token missing or wrong`);
-    pageHeaders(res);
-    res
-      .status(403)
-      .type("html")
-      .send(
-        renderMessage(
-          "Nicht bestätigt",
-          "Diese Anfrage konnte nicht bestätigt werden. Öffne die Verbindungsseite neu und versuch es noch einmal – oder starte die Verbindung in Claude erneut.",
-        ),
-      );
+    if (nonce && sameToken(field, csrfToken(session.id, nonce))) return next();
+    console.error(`Connect page: ${req.method} ${req.path.replace(session.id, ":sid")} refused, CSRF token missing or wrong`);
+    refuse(
+      res,
+      "Nicht bestätigt",
+      "Diese Anfrage konnte nicht bestätigt werden. Öffne die Verbindungsseite neu und versuch es noch einmal – oder starte die Verbindung in Claude erneut.",
+    );
   };
 
   const backToPage = (res: Response, session: SessionRow, kind: "e" | "n", code: string, tenantId?: string): void => {
@@ -247,16 +307,15 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
     res.redirect(303, `/connect/${encodeURIComponent(session.id)}?${params}`);
   };
 
-  app.get("/connect/:sid", (req, res) => {
-    const session = loadSession(req, res);
-    if (!session) return;
+  app.get("/connect/:sid", guardSession, (req, res) => {
+    const session = sessionOf(res);
     const tenant = typeof req.query.t === "string" ? tenantById.get(req.query.t) : undefined;
     const message = (key: unknown): string | undefined => (typeof key === "string" && MESSAGES[key] ? MESSAGES[key](tenant) : undefined);
     const error = message(req.query.e);
     const notice = message(req.query.n);
     const viewer = viewerOf(res);
     const clientName = session.kind === "authorize" && session.client_id ? store.getClient(session.client_id)?.client_name : undefined;
-    const token = issueCsrf(res, session);
+    const token = issueCsrf(req, res, session);
     pageHeaders(res);
     res.type("html").send(
       renderConnectPage({
@@ -272,23 +331,21 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
     );
   });
 
-  app.get("/connect/:sid/tenants/:tid/key", (req, res) => {
-    const session = loadSession(req, res);
-    if (!session) return;
+  app.get("/connect/:sid/tenants/:tid/key", guardSession, (req, res) => {
+    const session = sessionOf(res);
     const tenant = tenantById.get(String(req.params.tid));
     if (!tenant) return expired(res);
-    const token = issueCsrf(res, session);
+    const token = issueCsrf(req, res, session);
     pageHeaders(res);
     res.type("html").send(renderKeyForm(session, tenant, token));
   });
 
-  app.post("/connect/:sid/tenants/:tid/key", formBody, requireCsrf, async (req, res) => {
-    const session = loadSession(req, res);
-    if (!session) return;
+  app.post("/connect/:sid/tenants/:tid/key", formBody, guardSession, requireCsrf, async (req, res) => {
+    const session = sessionOf(res);
     const tenant = tenantById.get(String(req.params.tid));
     if (!tenant) return expired(res);
     const fail = (message: string): void => {
-      const token = issueCsrf(res, session);
+      const token = issueCsrf(req, res, session);
       pageHeaders(res);
       res.status(400).type("html").send(renderKeyForm(session, tenant, token, message));
     };
@@ -341,17 +398,15 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
     backToPage(res, session, "n", "connected", tenant.id);
   });
 
-  app.post("/connect/:sid/tenants/:tid/disconnect", formBody, requireCsrf, (req, res) => {
-    const session = loadSession(req, res);
-    if (!session) return;
+  app.post("/connect/:sid/tenants/:tid/disconnect", formBody, guardSession, requireCsrf, (req, res) => {
+    const session = sessionOf(res);
     const tenantId = String(req.params.tid);
     store.deleteConnection(session.grant_id, tenantId);
     backToPage(res, session, "n", "disconnected", tenantId);
   });
 
-  app.post("/connect/:sid/finish", formBody, requireCsrf, (req, res) => {
-    const session = loadSession(req, res);
-    if (!session) return;
+  app.post("/connect/:sid/finish", formBody, guardSession, requireCsrf, (_req, res) => {
+    const session = sessionOf(res);
     if (session.kind === "manage") {
       store.deleteSession(session.id);
       pageHeaders(res);
@@ -360,13 +415,15 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
     }
     const usable = store.listConnections(session.grant_id).filter((c) => !c.broken_reason && tenantById.has(c.tenant_id));
     if (usable.length === 0) return backToPage(res, session, "e", "none_connected");
+    // Only an authorization sets the owner, never a manage link (which may have been forwarded).
+    const viewer = viewerOf(res);
+    if (access && viewer) store.claimGrant(session.grant_id, viewer);
     cookie.write(res, session.grant_id);
     res.redirect(303, provider.completeAuthorization(session));
   });
 
-  app.post("/connect/:sid/cancel", formBody, requireCsrf, (req, res) => {
-    const session = loadSession(req, res);
-    if (!session) return;
+  app.post("/connect/:sid/cancel", formBody, guardSession, requireCsrf, (_req, res) => {
+    const session = sessionOf(res);
     if (session.kind !== "authorize") return expired(res);
     res.redirect(303, provider.denyAuthorization(session));
   });

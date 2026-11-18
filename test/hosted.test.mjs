@@ -5,13 +5,15 @@
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
+import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 
 const ENTRY = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 const TENANTS = [
@@ -20,6 +22,7 @@ const TENANTS = [
   { id: 'metal', name: 'Dedicated servers', type: 'robot', writes: true },
 ];
 const ROBOT_AUTH = 'Basic ' + Buffer.from('#ws+abc:robot-secret').toString('base64');
+const SECRET = 'test-secret-test-secret-test-secret-1234';
 
 const freePort = () =>
   new Promise((resolve) => {
@@ -44,7 +47,7 @@ async function startHosted(env = {}, options = {}) {
       PORT: String(port),
       HOST: '127.0.0.1',
       HETZNER_MCP_PUBLIC_URL: url,
-      HETZNER_MCP_SECRET: 'test-secret-test-secret-test-secret-1234',
+      HETZNER_MCP_SECRET: SECRET,
       HETZNER_MCP_TENANTS: JSON.stringify({ tenants: TENANTS }),
       HETZNER_MCP_DB_PATH: path.join(dataDir, 'db.sqlite'),
       HETZNER_CLOUD_API_URL: `http://127.0.0.1:${fakePort}/v1`,
@@ -130,20 +133,55 @@ const form = (data, cookie) => ({
   body: new URLSearchParams(data),
 });
 
-/** What a browser holds after opening a connect page: the CSRF cookie and the token in the forms. */
-async function csrfFor(page) {
-  const res = await fetch(page);
+/**
+ * A browser: keeps the cookies the server sets (by name; attributes are not
+ * checked here) and sends them back, plus fixed extra headers (e.g. the
+ * Cloudflare Access token). Node's fetch has no cookie jar of its own.
+ */
+class Browser {
+  constructor(headers = {}) {
+    this.headers = headers;
+    this.cookies = new Map();
+  }
+  get cookieHeader() {
+    return [...this.cookies].map(([name, value]) => `${name}=${value}`).join('; ');
+  }
+  /** The value of the browser-binding cookie (with or without __Host- prefix). */
+  get nonce() {
+    return [...this.cookies].find(([name]) => name.endsWith('hetzner_mcp_browser'))?.[1];
+  }
+  async fetch(url, init = {}) {
+    const headers = { ...this.headers, ...(init.headers ?? {}), ...(this.cookies.size ? { cookie: this.cookieHeader } : {}) };
+    const res = await fetch(url, { redirect: 'manual', ...init, headers });
+    for (const line of res.headers.getSetCookie()) {
+      const [pair] = line.split(';');
+      const eq = pair.indexOf('=');
+      this.cookies.set(pair.slice(0, eq).trim(), pair.slice(eq + 1));
+    }
+    return res;
+  }
+  post(url, data) {
+    return this.fetch(url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(data) });
+  }
+}
+
+/** The form token the server expects from a browser with `nonce` for session `sid` (the test knows the secret). */
+const csrfToken = (sid, nonce) => createHmac('sha256', SECRET).update(`csrf:${sid}:${nonce}`).digest('base64url');
+const sidOf = (page) => new URL(page).pathname.split('/')[2];
+
+/** What `browser` holds after opening a connect page: the browser cookie and the token in the forms. */
+async function csrfFor(page, browser = new Browser()) {
+  const res = await browser.fetch(page);
   const html = await res.text();
-  const cookie = /hetzner_mcp_csrf=[^;]+/.exec(res.headers.get('set-cookie') ?? '')?.[0];
   const csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1];
-  assert.ok(cookie && csrf, 'connect page must set a CSRF cookie and carry the token in its forms');
-  return { cookie, csrf, html, res };
+  assert.ok(browser.nonce && csrf, `connect page must set the browser cookie and carry the token in its forms (HTTP ${res.status})`);
+  return { browser, cookie: browser.cookieHeader, csrf, html, res };
 }
 
 /** Posts a form of the connect page `page` (e.g. '/finish', '/tenants/prod/key') the way a browser does. */
-async function submit(page, action, data = {}) {
-  const { cookie, csrf } = await csrfFor(page);
-  return fetch(`${page}${action}`, form({ ...data, csrf }, cookie));
+async function submit(page, action, data = {}, browser = new Browser()) {
+  const { csrf } = await csrfFor(page, browser);
+  return browser.post(`${page}${action}`, { ...data, csrf });
 }
 
 const registerRaw = (at, redirectUri, clientName = 'test client') =>
@@ -153,50 +191,53 @@ const registerRaw = (at, redirectUri, clientName = 'test client') =>
     body: JSON.stringify({ redirect_uris: [redirectUri], client_name: clientName, token_endpoint_auth_method: 'none' }),
   });
 
-/** Runs the MCP client's OAuth flow up to the connect page. */
-async function startAuthorization() {
+/** Runs the MCP client's OAuth flow up to the connect page, in `browser` (which sends its grant cookie to /authorize). */
+async function startAuthorization({ browser = new Browser(), at = base, publicUrl = at } = {}) {
   const redirectUri = 'http://localhost:9/callback';
-  const reg = await registerRaw(base, redirectUri);
+  const reg = await registerRaw(at, redirectUri);
   assert.equal(reg.status, 201, await reg.clone().text());
   const client = await reg.json();
   const verifier = randomBytes(32).toString('base64url');
   const challenge = createHash('sha256').update(verifier).digest('base64url');
-  const authorize = await fetch(
-    `${base}/authorize?${new URLSearchParams({ response_type: 'code', client_id: client.client_id, redirect_uri: redirectUri, code_challenge: challenge, code_challenge_method: 'S256', state: 'xyz', resource: `${base}/mcp` })}`,
-    { redirect: 'manual' },
+  const authorize = await browser.fetch(
+    `${at}/authorize?${new URLSearchParams({ response_type: 'code', client_id: client.client_id, redirect_uri: redirectUri, code_challenge: challenge, code_challenge_method: 'S256', state: 'xyz', resource: `${publicUrl}/mcp` })}`,
   );
   assert.equal(authorize.status, 302, await authorize.clone().text());
   const page = authorize.headers.get('location');
   assert.match(page, /^\/connect\/[\w-]+$/);
-  return { client, verifier, redirectUri, page: `${base}${page}` };
+  return { client, verifier, redirectUri, page: `${at}${page}`, browser, at };
 }
 
-async function finishAuthorization({ client, verifier, redirectUri, page }) {
-  const finish = await submit(page, '/finish');
+async function finishAuthorization({ client, verifier, redirectUri, page, browser, at }) {
+  const finish = await submit(page, '/finish', {}, browser);
   assert.equal(finish.status, 303);
   const target = new URL(finish.headers.get('location'));
   assert.equal(target.origin + target.pathname, redirectUri);
   assert.equal(target.searchParams.get('state'), 'xyz');
-  const token = await fetch(`${base}/token`, form({ grant_type: 'authorization_code', code: target.searchParams.get('code'), code_verifier: verifier, client_id: client.client_id, redirect_uri: redirectUri }));
+  const token = await fetch(`${at}/token`, form({ grant_type: 'authorization_code', code: target.searchParams.get('code'), code_verifier: verifier, client_id: client.client_id, redirect_uri: redirectUri }));
   assert.equal(token.status, 200, await token.clone().text());
   return token.json();
 }
 
 let rpcId = 0;
-async function rpc(accessToken, method, params) {
-  const res = await fetch(`${base}/mcp`, {
+async function rpc(accessToken, method, params, at = base) {
+  const res = await fetch(`${at}/mcp`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}) },
     body: JSON.stringify({ jsonrpc: '2.0', id: ++rpcId, method, ...(params ? { params } : {}) }),
   });
   return { status: res.status, body: res.status === 200 ? await res.json() : await res.text() };
 }
-const call = async (accessToken, name, args) => {
-  const { body } = await rpc(accessToken, 'tools/call', { name, arguments: args });
+const call = async (accessToken, name, args, at = base) => {
+  const { body } = await rpc(accessToken, 'tools/call', { name, arguments: args }, at);
   return { text: body.result.content[0].text, isError: body.result.isError === true, structured: body.result.structuredContent };
 };
 
+const MANAGE_WARNING = /Hat dir jemand diesen Link geschickt, schließ die Seite\.<\/b> Jeden Token, den du hier hinterlegst, kann diese Person verwenden/;
+
 let tokens;
+/** The browser that finished the first authorization: it carries the grant cookie of `tokens`. */
+let ownerBrowser;
 
 test('OAuth metadata is served and /mcp requires a token', async () => {
   const meta = await (await fetch(`${base}/.well-known/oauth-authorization-server`)).json();
@@ -232,6 +273,7 @@ test('connect page: rejects bad credentials, stores good ones, then issues token
   assert.doesNotMatch(after, /token-prod-1111|robot-secret/);
 
   tokens = await finishAuthorization(flow);
+  ownerBrowser = flow.browser;
   assert.ok(tokens.access_token && tokens.refresh_token);
   assert.equal((await fetch(flow.page)).status, 400, 'session is single use');
 
@@ -292,6 +334,69 @@ test('rejected credentials are marked and the model gets a link to replace them'
   assert.equal((await submit(link, '/tenants/stage/key', { api_token: 'token-stage-3333' })).status, 303);
   const repaired = await call(tokens.access_token, 'hetzner_query', { code: "async () => (await hetzner.get('/servers')).servers[0].name", project: 'stage' });
   assert.equal(JSON.parse(repaired.text), 'server-of-token-stage-3333');
+});
+
+test('manage links: warning on the page, refused in a browser connected with another grant', async () => {
+  const link = (await call(tokens.access_token, 'hetzner_list_accounts', {})).structured.connect_url;
+  const sid = sidOf(link);
+
+  // A browser without grant cookie gets the page with the warning; the connected accounts stay visible.
+  const page = await (await fetch(link)).text();
+  assert.match(page, MANAGE_WARNING);
+  assert.match(page, /Token …1111/);
+  assert.match(await (await fetch(`${link}/tenants/stage/key`)).text(), MANAGE_WARNING);
+  // The authorization page has its own notice, not this one.
+  assert.doesNotMatch(await (await fetch((await startAuthorization()).page)).text(), MANAGE_WARNING);
+
+  // A colleague whose browser finished its own authorization (grant cookie of another grant).
+  const colleague = await startAuthorization();
+  assert.equal((await submit(colleague.page, '/tenants/prod/key', { api_token: 'token-prod-1111' }, colleague.browser)).status, 303);
+  await finishAuthorization(colleague);
+  const refused = await colleague.browser.fetch(link);
+  assert.equal(refused.status, 403);
+  const refusedText = await refused.text();
+  assert.match(refusedText, /anderen Claude-Zugang als dem, der in diesem Browser verbunden ist/);
+  assert.doesNotMatch(refusedText, /<form/);
+  assert.equal((await colleague.browser.fetch(`${link}/tenants/stage/key`)).status, 403);
+  // Not even a form token that would be valid for this browser gets through.
+  fake.tokens.add('token-colleague-5555');
+  fake.calls.length = 0;
+  const csrf = csrfToken(sid, colleague.browser.nonce);
+  for (const [action, data] of [
+    ['/tenants/stage/key', { api_token: 'token-colleague-5555' }],
+    ['/tenants/prod/disconnect', {}],
+    ['/finish', {}],
+  ]) {
+    assert.equal((await colleague.browser.post(`${link}${action}`, { ...data, csrf })).status, 403, action);
+  }
+  assert.equal(fake.calls.length, 0, 'no credential check was made');
+  const accounts = Object.fromEntries((await call(tokens.access_token, 'hetzner_list_accounts', {})).structured.accounts.map((a) => [a.id, a]));
+  assert.equal(accounts.stage.connected_as, 'Token …3333', 'nothing stored in the grant of the link');
+  assert.equal(accounts.prod.status, 'connected');
+
+  // The colleague's own browser still authorizes normally: /authorize reuses the grant of its cookie.
+  const again = await startAuthorization({ browser: colleague.browser });
+  const againPage = await colleague.browser.fetch(again.page);
+  assert.equal(againPage.status, 200);
+  assert.match(await againPage.text(), /Token …1111/);
+
+  // A signed grant cookie for a grant that no longer exists does not block: /authorize starts a new grant.
+  const stale = new Browser();
+  stale.cookies.set('hetzner_mcp_grant', `gone.${createHmac('sha256', SECRET).update('grant:gone').digest('base64url')}`);
+  const fresh = await startAuthorization({ browser: stale });
+  assert.equal((await stale.fetch(fresh.page)).status, 200);
+
+  // The browser carrying the link's own grant cookie uses the page as before (with the warning).
+  const own = await csrfFor(link, ownerBrowser);
+  assert.equal(own.res.status, 200);
+  assert.match(own.html, MANAGE_WARNING);
+  assert.equal(own.csrf, csrfToken(sid, ownerBrowser.nonce));
+  assert.equal((await submit(link, '/tenants/stage/key', { api_token: 'token-colleague-5555' }, ownerBrowser)).status, 303);
+  const updated = Object.fromEntries((await call(tokens.access_token, 'hetzner_list_accounts', {})).structured.accounts.map((a) => [a.id, a]));
+  assert.equal(updated.stage.connected_as, 'Token …5555');
+  const done = await submit(link, '/finish', {}, ownerBrowser);
+  assert.equal(done.status, 200);
+  assert.match(await done.text(), /Fertig/);
 });
 
 test('refresh tokens rotate and a second person sees only their own connections', async () => {
@@ -381,9 +486,14 @@ describe('hosted mode: who may receive the access (confused deputy)', () => {
     assert.match(html, /nicht geprüft/);
     assert.match(html, /deinem eigenen Computer<\/b> \(localhost:9\)/);
     assert.match(html, /Abbrechen/);
-    assert.match(res.headers.get('set-cookie') ?? '', /HttpOnly/i);
-    assert.match(res.headers.get('set-cookie') ?? '', /SameSite=Strict/i);
-    assert.match(res.headers.get('set-cookie') ?? '', new RegExp(`Path=${new URL(flow.page).pathname}`));
+    // Over plain http (localhost) the browser cookie cannot carry the __Host- prefix.
+    const setCookie = res.headers.getSetCookie().find((c) => c.includes('hetzner_mcp_browser'));
+    assert.match(setCookie, /^hetzner_mcp_browser=[\w-]{43};/);
+    assert.match(setCookie, /;\s*HttpOnly/i);
+    assert.match(setCookie, /;\s*SameSite=Lax/i);
+    assert.match(setCookie, /;\s*Path=\/(;|$)/);
+    assert.doesNotMatch(setCookie, /;\s*Secure/i);
+    assert.ok(!res.headers.getSetCookie().some((c) => c.startsWith('hetzner_mcp_csrf=')), 'the old per-session cookie is gone');
 
     // A remote redirect target is shown by host, so a person can check it.
     const reg = await registerRaw(base, 'https://claude.ai/api/mcp/auth_callback', 'Claude');
@@ -397,27 +507,205 @@ describe('hosted mode: who may receive the access (confused deputy)', () => {
 
   test('the connect page forms cannot be posted cross-site (CSRF)', async () => {
     const flow = await startAuthorization();
-    const { cookie, csrf } = await csrfFor(flow.page);
+    const { browser, cookie, csrf } = await csrfFor(flow.page);
+    const post = (action, data, cookieHeader) => fetch(`${flow.page}${action}`, form(data, cookieHeader));
 
-    // A cross-site post may know the token from the page at best, never carries the Strict cookie.
-    const noCookie = await fetch(`${flow.page}/tenants/prod/key`, form({ api_token: 'token-prod-1111', csrf }));
+    // A cross-site post may know a token at best, but never carries the browser cookie that fits it.
+    const noCookie = await post('/tenants/prod/key', { api_token: 'token-prod-1111', csrf });
     assert.equal(noCookie.status, 403);
     assert.match(await noCookie.text(), /Nicht bestätigt/);
     assert.doesNotMatch(await (await fetch(flow.page)).text(), /Token …1111/, 'nothing stored');
 
     for (const action of ['/finish', '/cancel', '/tenants/prod/disconnect']) {
-      assert.equal((await fetch(`${flow.page}${action}`, form({}))).status, 403, `${action} without cookie and token`);
-      assert.equal((await fetch(`${flow.page}${action}`, form({ csrf }))).status, 403, `${action} without cookie`);
-      assert.equal((await fetch(`${flow.page}${action}`, form({}, cookie))).status, 403, `${action} without token`);
+      assert.equal((await post(action, {})).status, 403, `${action} without cookie and token`);
+      assert.equal((await post(action, { csrf })).status, 403, `${action} without cookie`);
+      assert.equal((await post(action, {}, cookie)).status, 403, `${action} without token`);
+      assert.equal((await post(action, { csrf }, 'hetzner_mcp_browser=short')).status, 403, `${action} with a malformed cookie`);
     }
-    // A token from another session does not fit this one.
-    const other = await startAuthorization();
-    const foreign = await csrfFor(other.page);
-    assert.equal((await fetch(`${flow.page}/finish`, form({ csrf: foreign.csrf }, foreign.cookie))).status, 403);
+    // The old scheme (token from the session id alone, per-session cookie) no longer passes.
+    const legacy = createHmac('sha256', SECRET).update(`csrf:${sidOf(flow.page)}`).digest('base64url');
+    assert.equal((await post('/finish', { csrf: legacy }, `hetzner_mcp_csrf=${legacy}`)).status, 403);
 
-    // The session is untouched and works with the real cookie and token.
-    assert.equal((await submit(flow.page, '/tenants/prod/key', { api_token: 'token-prod-1111' })).status, 303);
-    const done = await finishAuthorization(flow);
+    // A token from another session does not fit this one, also in the same browser.
+    const other = await startAuthorization();
+    const foreign = await csrfFor(other.page, browser);
+    assert.equal(browser.cookieHeader, cookie, 'an existing browser cookie is reused');
+    assert.equal((await browser.post(`${flow.page}/finish`, { csrf: foreign.csrf })).status, 403);
+
+    // The session is untouched and works with the browser's own cookie and token.
+    assert.equal((await submit(flow.page, '/tenants/prod/key', { api_token: 'token-prod-1111' }, browser)).status, 303);
+    const done = await finishAuthorization({ ...flow, browser });
     assert.ok(done.access_token);
+  });
+
+  test('the form token is bound to the browser: a token from another browser is refused', async () => {
+    const flow = await startAuthorization();
+    const victim = await csrfFor(flow.page, new Browser());
+    const attacker = await csrfFor(flow.page, new Browser());
+    assert.notEqual(attacker.csrf, victim.csrf);
+    assert.notEqual(attacker.browser.nonce, victim.browser.nonce);
+
+    // The attacker knows the link, opens the page himself and makes the victim's browser post his
+    // token: the victim's browser sends the victim's cookie, which the token does not fit.
+    fake.calls.length = 0;
+    const forged = await victim.browser.post(`${flow.page}/tenants/prod/key`, { api_token: 'token-prod-1111', csrf: attacker.csrf });
+    assert.equal(forged.status, 403);
+    // Likewise the victim's token in another browser.
+    assert.equal((await attacker.browser.post(`${flow.page}/tenants/prod/key`, { api_token: 'token-prod-1111', csrf: victim.csrf })).status, 403);
+    assert.equal((await victim.browser.post(`${flow.page}/finish`, { csrf: attacker.csrf })).status, 403);
+    assert.equal(fake.calls.length, 0);
+    assert.doesNotMatch(await (await fetch(flow.page)).text(), /Token …1111/, 'nothing stored');
+
+    // Each browser's own token works.
+    assert.equal((await victim.browser.post(`${flow.page}/tenants/prod/key`, { api_token: 'token-prod-1111', csrf: victim.csrf })).status, 303);
+  });
+
+  test('with an https public URL the browser cookie is a __Host- cookie', async () => {
+    const port = await freePort();
+    // Requested over plain http directly, as a reverse proxy would.
+    const secure = await startHosted({ HETZNER_MCP_PUBLIC_URL: `https://127.0.0.1:${port}` }, { port });
+    try {
+      const flow = await startAuthorization({ at: secure.base, publicUrl: `https://127.0.0.1:${port}` });
+      const { res, browser } = await csrfFor(flow.page, flow.browser);
+      const setCookie = res.headers.getSetCookie().find((c) => c.includes('hetzner_mcp_browser'));
+      assert.match(setCookie, /^__Host-hetzner_mcp_browser=[\w-]{43};/);
+      assert.match(setCookie, /;\s*Secure(;|$)/i);
+      assert.match(setCookie, /;\s*Path=\/(;|$)/);
+      assert.match(setCookie, /;\s*HttpOnly/i);
+      assert.match(setCookie, /;\s*SameSite=Lax/i);
+      assert.match(setCookie, /;\s*Max-Age=86400/i);
+      assert.doesNotMatch(setCookie, /Domain=/i);
+      assert.ok(!browser.cookies.has('hetzner_mcp_browser'));
+
+      // The same cookie is kept on the next page, and the forms work with it.
+      const nonce = browser.nonce;
+      await csrfFor(`${flow.page}/tenants/prod/key`, browser);
+      assert.equal(browser.nonce, nonce);
+      assert.equal((await submit(flow.page, '/tenants/prod/key', { api_token: 'token-prod-1111' }, browser)).status, 303);
+      // The unprefixed name is not accepted in its place.
+      const csrf = csrfToken(sidOf(flow.page), nonce);
+      assert.equal((await fetch(`${flow.page}/finish`, form({ csrf }, `hetzner_mcp_browser=${nonce}`))).status, 403);
+    } finally {
+      await secure.stop();
+    }
+  });
+});
+
+describe('hosted mode behind Cloudflare Access: grants have an owner', () => {
+  let jwks, issuer, privateKey;
+  const AUD = 'test-aud';
+
+  before(async () => {
+    const pair = await generateKeyPair('RS256');
+    privateKey = pair.privateKey;
+    const jwk = { ...(await exportJWK(pair.publicKey)), kid: 'test-key', alg: 'RS256', use: 'sig' };
+    const port = await freePort();
+    issuer = `http://127.0.0.1:${port}`;
+    // Stands in for <team>.cloudflareaccess.com: serves the signing keys.
+    jwks = http.createServer((req, res) => {
+      const found = req.url === '/cdn-cgi/access/certs';
+      res.writeHead(found ? 200 : 404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(found ? { keys: [jwk] } : {}));
+    });
+    await new Promise((r) => jwks.listen(port, '127.0.0.1', r));
+  });
+  after(() => jwks?.close());
+
+  /** A browser that passed Cloudflare Access as `email`. */
+  const signedIn = async (email) =>
+    new Browser({
+      'cf-access-jwt-assertion': await new SignJWT({ email })
+        .setProtectedHeader({ alg: 'RS256', kid: 'test-key' })
+        .setIssuer(issuer)
+        .setAudience(AUD)
+        .setIssuedAt()
+        .setExpirationTime('10m')
+        .sign(privateKey),
+    });
+
+  test('the first authorization sets the owner; only the owner may open the grant\'s pages', async () => {
+    // A database from before grants had an owner, with one grant and an MCP access token for it.
+    const dataDir = mkdtempSync(path.join(tmpdir(), 'hetzner-mcp-test-'));
+    const dbFile = path.join(dataDir, 'db.sqlite');
+    const now = Math.floor(Date.now() / 1000);
+    const legacyToken = randomBytes(32).toString('base64url');
+    const old = new DatabaseSync(dbFile);
+    old.exec(`CREATE TABLE grants (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);
+      CREATE TABLE tokens (token_hash TEXT PRIMARY KEY, kind TEXT NOT NULL, grant_id TEXT NOT NULL, client_id TEXT NOT NULL,
+        resource TEXT, expires_at INTEGER NOT NULL);`);
+    old.prepare('INSERT INTO grants VALUES (?, ?, ?)').run('legacy-grant', now, now);
+    old.prepare('INSERT INTO tokens VALUES (?, ?, ?, ?, ?, ?)').run(createHash('sha256').update(legacyToken).digest('hex'), 'access', 'legacy-grant', 'legacy-client', null, now + 3600);
+    old.close();
+    const query = (sql, ...args) => {
+      const db = new DatabaseSync(dbFile, { readOnly: true });
+      try {
+        return db.prepare(sql).get(...args);
+      } finally {
+        db.close();
+      }
+    };
+    const ownerOf = (grantId) => query('SELECT owner FROM grants WHERE id = ?', grantId)?.owner ?? null;
+    const grantOf = (accessToken) => query('SELECT grant_id FROM tokens WHERE token_hash = ?', createHash('sha256').update(accessToken).digest('hex')).grant_id;
+
+    const srv = await startHosted({ HETZNER_MCP_CF_ACCESS_TEAM_DOMAIN: issuer, HETZNER_MCP_CF_ACCESS_AUD: AUD }, { dir: dataDir });
+    try {
+      // Migrated: the old grant has no owner. Its manage link opens for whoever passes Access (with the
+      // warning), and finishing a manage session never sets an owner.
+      assert.equal(ownerOf('legacy-grant'), null);
+      const legacyLink = (await call(legacyToken, 'hetzner_list_accounts', {}, srv.base)).structured.connect_url;
+      assert.equal((await fetch(legacyLink)).status, 403, 'no Access token');
+      const bob = await signedIn('bob@example.com');
+      const legacyPage = await bob.fetch(legacyLink);
+      assert.equal(legacyPage.status, 200);
+      assert.match(await legacyPage.text(), MANAGE_WARNING);
+      assert.equal((await submit(legacyLink, '/finish', {}, bob)).status, 200);
+      assert.equal(ownerOf('legacy-grant'), null);
+
+      // Alice authorizes: finishing records her as the owner.
+      const alice = await signedIn('alice@example.com');
+      const flow = await startAuthorization({ browser: alice, at: srv.base });
+      assert.equal((await submit(flow.page, '/tenants/prod/key', { api_token: 'token-prod-1111' }, alice)).status, 303);
+      const aliceTokens = await finishAuthorization(flow);
+      const grantId = grantOf(aliceTokens.access_token);
+      assert.equal(ownerOf(grantId), 'alice@example.com');
+
+      // Her manage link, forwarded to Bob: refused (his browser has no grant cookie, the owner check
+      // stands alone), without telling him whose link it is.
+      const link = (await call(aliceTokens.access_token, 'hetzner_list_accounts', {}, srv.base)).structured.connect_url;
+      const bobFresh = await signedIn('bob@example.com');
+      const refused = await bobFresh.fetch(link);
+      assert.equal(refused.status, 403);
+      const refusedText = await refused.text();
+      assert.match(refusedText, /einer anderen Person/);
+      assert.doesNotMatch(refusedText, /alice/i);
+      assert.doesNotMatch(refusedText, /<form/);
+      assert.equal((await bobFresh.fetch(`${link}/tenants/stage/key`)).status, 403);
+      // Not even with a form token that fits his browser.
+      const nonce = randomBytes(32).toString('base64url');
+      bobFresh.cookies.set('hetzner_mcp_browser', nonce);
+      fake.tokens.add('token-bob-6666');
+      const forged = await bobFresh.post(`${link}/tenants/stage/key`, { api_token: 'token-bob-6666', csrf: csrfToken(sidOf(link), nonce) });
+      assert.equal(forged.status, 403);
+      const accounts = Object.fromEntries((await call(aliceTokens.access_token, 'hetzner_list_accounts', {}, srv.base)).structured.accounts.map((a) => [a.id, a]));
+      assert.equal(accounts.stage.status, 'not_connected', 'nothing stored');
+      assert.match(srv.log, /bob@example\.com is not the owner of this grant/);
+
+      // Alice in another browser, with different capitalisation, gets in.
+      const aliceElsewhere = await signedIn('Alice@Example.COM');
+      const own = await aliceElsewhere.fetch(link);
+      assert.equal(own.status, 200);
+      assert.match(await own.text(), /Token …1111/);
+      assert.equal((await submit(link, '/tenants/stage/key', { api_token: 'token-bob-6666' }, aliceElsewhere)).status, 303);
+      assert.equal((await submit(link, '/finish', {}, aliceElsewhere)).status, 200);
+      assert.equal(ownerOf(grantId), 'alice@example.com');
+
+      // A new authorization from Alice's browser reuses her grant; the owner stays.
+      const again = await startAuthorization({ browser: alice, at: srv.base });
+      assert.equal((await alice.fetch(again.page)).status, 200);
+      await finishAuthorization(again);
+      assert.equal(ownerOf(grantId), 'alice@example.com');
+    } finally {
+      await srv.stop();
+    }
   });
 });

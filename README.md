@@ -226,7 +226,7 @@ a token stored under "Production" really is from that project.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `HETZNER_MCP_PUBLIC_URL` | — | **Required.** Public https base URL. The connector URL is `<this>/mcp`. |
-| `HETZNER_MCP_SECRET` | — | **Required.** ≥ 32 characters; encrypts stored credentials and signs the browser cookie. Changing it invalidates all connections. |
+| `HETZNER_MCP_SECRET` | — | **Required.** ≥ 32 characters; encrypts stored credentials and signs the browser cookies and form tokens. Changing it invalidates all connections. |
 | `HETZNER_MCP_TENANTS_FILE` / `HETZNER_MCP_TENANTS` | — | **Required.** Path to the tenant JSON, or the JSON inline. |
 | `HETZNER_MCP_DB_PATH` | `./data/hetzner-mcp.sqlite` | SQLite file. Put it on a persistent volume. |
 | `PORT` / `HOST` | `3000` / `0.0.0.0` | Listen address. |
@@ -278,9 +278,39 @@ Two independent checks prevent that:
 - **The connect page says who asks.** On top of the page it shows the app's name (declared
   by the app itself, so marked as unverified) and, more importantly, the address the access
   goes to, with the advice to cancel if the person did not start the connection in Claude
-  themselves. Every form on the page (store credentials, *Trennen*, *Fertig*, *Abbrechen*)
-  carries a CSRF token that must match an `HttpOnly`, `SameSite=Strict` cookie scoped to the
-  session, so another site that knows the link cannot submit them on the person's behalf.
+  themselves.
+
+**CSRF.** Every form on the connect pages (store credentials, *Trennen*, *Fertig*,
+*Abbrechen*) carries a token bound to both the session and the browser:
+`HMAC(HETZNER_MCP_SECRET, "csrf:<session id>:<browser nonce>")`. The nonce is 32 random bytes
+in an `HttpOnly`, `SameSite=Lax` cookie (one day, renewed with every page), named
+`__Host-hetzner_mcp_browser` when the public URL is https (`Secure`, `Path=/`, no `Domain`),
+`hetzner_mcp_browser` on plain-http localhost. Whoever started `/authorize` knows the session
+id and can open the page, but only gets a token for *their own* nonce: they cannot read the
+victim's nonce, cannot compute the HMAC without the secret, and thanks to the `__Host-` prefix
+cannot plant a nonce of their choosing from a sibling subdomain either, although that is
+the same site.
+
+**Manage links.** `hetzner_list_accounts` hands the model a link (valid 30 minutes) to the
+caller's own connections. A link like that can be forwarded, and any API token the recipient
+stores there would end up in the sender's grant, usable by the sender. Three layers guard it:
+
+- **Warning.** Pages opened from a manage link (and their credential forms) say prominently
+  that they manage the connections of the Claude access the link came from, to use them
+  only if Claude gave the link in one's own chat, and to close the page otherwise.
+- **Browser check.** A browser that finished an authorization remembers its grant in a
+  signed cookie. Any `/connect/…` page or form, of any session kind, whose grant differs from
+  a valid grant cookie in the browser is refused with a page that renders no forms. Browsers
+  without that cookie fall back to the warning. The normal flow is not affected:
+  `/authorize` reuses the grant of the cookie, so a connection started in the same browser
+  belongs to the same grant (a signed cookie for a grant that no longer exists counts as
+  absent).
+- **Owner (with Cloudflare Access).** When an authorization finishes (*Fertig*), the grant
+  records the Access e-mail of the person as its owner, once; manage sessions never set it.
+  From then on, every `/connect/…` request for that grant needs the same Access identity
+  (case-insensitive), otherwise it gets a 403 that does not reveal the owner's address. Grants
+  created before this version have no owner and rely on the first two layers until their
+  next authorization.
 
 ## Security
 

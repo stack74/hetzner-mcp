@@ -41,6 +41,9 @@ details { margin-top:24px; color:var(--muted); font-size:13px; }
 .request { padding:14px 16px; margin-bottom:20px; border-color:var(--warn); }
 .request p { margin:0 0 8px; } .request p:last-child { margin-bottom:0; }
 .muted { color:var(--muted); font-size:13px; }
+.warning { padding:14px 16px; margin-bottom:20px; border:2px solid var(--warn); }
+.warning p { margin:0 0 8px; } .warning p:last-child { margin-bottom:0; }
+.warning .title { color:var(--warn); font-weight:600; }
 `;
 
 let iconLink = "";
@@ -59,7 +62,7 @@ function layout(title: string, body: string): string {
 const formatDate = (seconds: number): string =>
   new Date(seconds * 1000).toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "numeric", timeZone: "Europe/Berlin" });
 
-/** Hidden CSRF field for every POST form on the connect pages (checked against a SameSite=Strict cookie). */
+/** Hidden CSRF field for every POST form on the connect pages (bound to the session and to this browser's cookie). */
 const csrfField = (token: string): string => `<input type="hidden" name="csrf" value="${escape(token)}">`;
 
 /** Where the access goes once the person presses "Fertig", in words they can check. */
@@ -73,6 +76,19 @@ export function describeTarget(redirectUri: string): string {
   } catch {
     return escape(redirectUri);
   }
+}
+
+/**
+ * On pages opened from a "manage" link: the link hands out access to the grant of
+ * whoever got it from Claude, so a forwarded link must not be used by the recipient.
+ */
+function manageWarning(session: SessionRow): string {
+  if (session.kind !== "manage") return "";
+  return `<div class="card warning">
+      <p class="title">Achtung: Diese Seite verwaltet die Verbindungen des Claude-Zugangs, aus dem dieser Link stammt.</p>
+      <p>Nutze sie nur, wenn Claude dir diesen Link in deinem eigenen Chat gegeben hat.</p>
+      <p><b>Hat dir jemand diesen Link geschickt, schließ die Seite.</b> Jeden Token, den du hier hinterlegst, kann diese Person verwenden.</p>
+    </div>`;
 }
 
 const kindLabel = (tenant: TenantConfig): string => (tenant.type === "robot" ? "Robot" : "Cloud-Projekt");
@@ -103,7 +119,7 @@ export interface ConnectPageInput {
   /** Who is looking, when Cloudflare Access is in front (their e-mail). */
   viewer?: string;
   session: SessionRow;
-  /** CSRF token for the POST forms; the same value is set as cookie. */
+  /** CSRF token for the POST forms, bound to the session and the browser cookie. */
   csrfToken: string;
   /** For "authorize" sessions: the client_name the MCP client registered with (self-declared). */
   clientName?: string;
@@ -149,6 +165,7 @@ export function renderConnectPage({ viewer, session, csrfToken, clientName, tena
     Was du nicht brauchst, lässt du einfach aus – du kannst es später ergänzen.</p>
     ${viewer ? `<p class="status" style="margin:-16px 0 20px">Angemeldet als ${escape(viewer)}</p>` : ""}
     ${request}
+    ${manageWarning(session)}
     ${banners}
     <div class="card">${tenants.map((t) => tenantRow(session.id, csrfToken, t, byTenant.get(t.id))).join("")}</div>
     ${footer}
@@ -189,6 +206,7 @@ export function renderKeyForm(session: SessionRow, tenant: TenantConfig, csrfTok
     `${tenant.name} verbinden`,
     `<h1>„${escape(tenant.name)}“ verbinden</h1>
     <p class="lead">${tenant.type === "robot" ? "Hinterlege den Webservice-Benutzer deines Robot-Accounts." : "Hinterlege einen API-Token aus diesem Projekt."}</p>
+    ${manageWarning(session)}
     ${error ? `<div class="banner error">${escape(error)}</div>` : ""}
     <div class="card" style="padding:16px">
       <form method="post" action="${action}">

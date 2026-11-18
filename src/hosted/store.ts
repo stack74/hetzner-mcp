@@ -3,7 +3,9 @@
  *
  * Vocabulary:
  *  - grant:      one person's bundle of Hetzner connections. Every token this
- *                server issues to an MCP client points at a grant.
+ *                server issues to an MCP client points at a grant. Behind
+ *                Cloudflare Access it records its owner (the e-mail of whoever
+ *                finished the first authorization).
  *  - connection: a grant's credentials for one tenant (Cloud project or Robot account).
  *  - session:    a short-lived visit to the connect page, either during the MCP
  *                client's OAuth authorization ("authorize") or from a link the
@@ -70,7 +72,7 @@ export interface CodeRow {
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS oauth_clients (client_id TEXT PRIMARY KEY, data TEXT NOT NULL, created_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL, owner TEXT);
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, grant_id TEXT NOT NULL, client_id TEXT, redirect_uri TEXT,
   code_challenge TEXT, state TEXT, resource TEXT, expires_at INTEGER NOT NULL);
@@ -95,11 +97,18 @@ export class Store {
     this.db = new DatabaseSync(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.db.exec(SCHEMA);
+    this.migrate();
     this.key = Buffer.from(hkdfSync("sha256", secret, "hetzner-mcp", "credential-encryption", 32));
   }
 
   close(): void {
     this.db.close();
+  }
+
+  /** Brings databases created by older versions up to the current schema. */
+  private migrate(): void {
+    const grantColumns = (this.db.prepare("PRAGMA table_info(grants)").all() as { name: string }[]).map((c) => c.name);
+    if (!grantColumns.includes("owner")) this.db.exec("ALTER TABLE grants ADD COLUMN owner TEXT");
   }
 
   // --- encryption --------------------------------------------------------
@@ -142,6 +151,17 @@ export class Store {
 
   grantExists(id: string): boolean {
     return this.db.prepare("SELECT 1 FROM grants WHERE id = ?").get(id) !== undefined;
+  }
+
+  /** Who the grant belongs to (Cloudflare Access e-mail), if known. Grants from before owners were recorded have none. */
+  getGrantOwner(id: string): string | null {
+    const row = this.db.prepare("SELECT owner FROM grants WHERE id = ?").get(id) as { owner: string | null } | undefined;
+    return row?.owner ?? null;
+  }
+
+  /** Records the owner unless the grant already has one; an owner is never replaced. */
+  claimGrant(id: string, owner: string): void {
+    this.db.prepare("UPDATE grants SET owner = ? WHERE id = ? AND owner IS NULL").run(owner, id);
   }
 
   touchGrant(id: string): void {
